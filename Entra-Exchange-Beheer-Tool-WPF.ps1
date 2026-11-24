@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Entra & Exchange Gebruikersbeheer (WPF) - per gebruiker en in bulk,
@@ -32,6 +32,11 @@
                   beheerder, verborgen-status, leden per groep en export.
                   Leden toevoegen/verwijderen (ook adressen plakken uit Outlook/
                   Excel) en contactpersonen aanmaken voor externe adressen.
+                  M365-groep: groepsinstellingen (groepsmail in de inbox van
+                  nieuwe/huidige leden, welkomstmail, extern mailen, MailTip,
+                  privacy, verbergen in GAL/Outlook, agenda alleen-lezen,
+                  beschrijving, verzenden als/namens) en per lid de groepsmail
+                  in de eigen inbox aan/uit (abonnees).
     Nieuwe groep: distributielijst, beveiligingsgroep met e-mail, Microsoft
                   365-groep, dynamische distributielijst of ruimtelijst aanmaken,
                   met eigenaren, leden (ook plakken) en instellingen (extern
@@ -144,6 +149,19 @@ $script:NewGroupRType = @{
     Distribution = 'MailUniversalDistributionGroup'; Security = 'MailUniversalSecurityGroup'; Unified = 'GroupMailbox'
     Dynamic = 'DynamicDistributionGroup'; RoomList = 'RoomList'
 }
+
+# Instellingen M365-groep (aan/uit): checkbox, eigenschap bij Get-UnifiedGroup,
+# parameter bij Set-UnifiedGroup en of de checkbox het omgekeerde toont.
+$script:GroupBoolSettings = @(
+    [pscustomobject]@{ Box = 'GS_ChkAutoSub';     Get = 'AutoSubscribeNewMembers';                Set = 'AutoSubscribeNewMembers';                Invert = $false; Label = 'Groepsmail naar inbox nieuwe leden' }
+    [pscustomobject]@{ Box = 'GS_ChkCalSub';      Get = 'AlwaysSubscribeMembersToCalendarEvents'; Set = 'AlwaysSubscribeMembersToCalendarEvents'; Invert = $false; Label = 'Groepsafspraken naar agenda nieuwe leden' }
+    [pscustomobject]@{ Box = 'GS_ChkSubEnabled';  Get = 'SubscriptionEnabled';                    Set = 'SubscriptionEnabled';                    Invert = $false; Label = 'Abonneren toegestaan' }
+    [pscustomobject]@{ Box = 'GS_ChkWelcome';     Get = 'WelcomeMessageEnabled';                  Set = 'UnifiedGroupWelcomeMessageEnabled';      Invert = $false; Label = 'Welkomstmail nieuwe leden' }
+    [pscustomobject]@{ Box = 'GS_ChkExternal';    Get = 'RequireSenderAuthenticationEnabled';     Set = 'RequireSenderAuthenticationEnabled';     Invert = $true;  Label = 'Extern mailen naar de groep' }
+    [pscustomobject]@{ Box = 'GS_ChkHideGal';     Get = 'HiddenFromAddressListsEnabled';          Set = 'HiddenFromAddressListsEnabled';          Invert = $false; Label = 'Verborgen in adresboek' }
+    [pscustomobject]@{ Box = 'GS_ChkHideOutlook'; Get = 'HiddenFromExchangeClientsEnabled';       Set = 'HiddenFromExchangeClientsEnabled';       Invert = $false; Label = 'Verborgen in Outlook' }
+    [pscustomobject]@{ Box = 'GS_ChkCalRO';       Get = 'CalendarMemberReadOnly';                 Set = 'CalendarMemberReadOnly';                 Invert = $false; Label = 'Groepsagenda alleen-lezen voor leden' }
+)
 
 $script:Queue      = New-Object System.Collections.ArrayList
 $script:QueueSeq   = 0
@@ -870,6 +888,19 @@ function Invoke-QueueItemExo {
             if ($d.Add) { return 'toegevoegd' }
             return 'verwijderd'
         }
+        'GroupSettings' {
+            return (Invoke-GroupSettings $d)
+        }
+        'GroupSubscriber' {
+            $grp = [string]$d.Group
+            $links = @($d.Members)
+            if ($d.Add) {
+                Invoke-Exo "Add-UnifiedGroupLinks $grp -LinkType Subscribers -Links $($links -join ',')" { Add-UnifiedGroupLinks -Identity $grp -LinkType Subscribers -Links $links -Confirm:$false -ErrorAction Stop }
+                return 'geabonneerd'
+            }
+            Invoke-Exo "Remove-UnifiedGroupLinks $grp -LinkType Subscribers -Links $($links -join ',')" { Remove-UnifiedGroupLinks -Identity $grp -LinkType Subscribers -Links $links -Confirm:$false -ErrorAction Stop }
+            return 'afgemeld'
+        }
     }
 }
 
@@ -1031,10 +1062,67 @@ function Add-NewGroupToQueue {
     return (Add-QueueItem -Kind 'NewGroup' -Target $Data.Name -Soort 'Nieuwe groep' -Text ($parts -join ', ') -Data $Data)
 }
 
+function Add-GroupSettingsToQueue {
+    # Instellingen van een Microsoft 365-groep (Set-UnifiedGroup). Set bevat
+    # parameternaam -> waarde, SobAdd/SobRemove de 'verzenden namens'-wijzigingen.
+    param([string]$GroupName, [string]$Group, [hashtable]$Set = @{}, [string[]]$SobAdd = @(), [string[]]$SobRemove = @(), [string]$Text)
+    return (Add-QueueItem -Kind 'GroupSettings' -Target $GroupName -Soort 'Groepsinstelling' -Text $Text `
+        -Data @{ Group = $Group; Set = $Set; SobAdd = @($SobAdd | Where-Object { $_ }); SobRemove = @($SobRemove | Where-Object { $_ }) })
+}
+
+function Add-GroupSubscriberToQueue {
+    # Groepsmail en -afspraken in de eigen inbox (abonnee van de M365-groep) aan/uit
+    param([string]$GroupName, [string]$Group, [string[]]$Members, [string]$Label, [bool]$Add)
+    $text = if ($Add) { "Groepsmail in inbox AANZETTEN voor $Label (groep $Group)" } else { "Groepsmail in inbox UITZETTEN voor $Label (groep $Group)" }
+    return (Add-QueueItem -Kind 'GroupSubscriber' -Target $GroupName -Soort 'Groepsabonnement' -Text $text `
+        -Data @{ Group = $Group; Members = @($Members); Label = $Label; Add = $Add })
+}
+
+function Invoke-GroupSettings {
+    # Voert 1 GroupSettings-item uit. Volgorde is belangrijk:
+    # - SubscriptionEnabled aan voordat AutoSubscribeNewMembers aan kan,
+    #   uit pas nadat AutoSubscribeNewMembers uit staat;
+    # - HiddenFromExchangeClientsEnabled verbergt zelf al in het adresboek,
+    #   daarom HiddenFromAddressListsEnabled apart en daarna.
+    param($D)
+    $grp = [string]$D.Group
+    $set = if ($D.Set) { $D.Set } else { @{} }
+    if ($set.ContainsKey('SubscriptionEnabled') -and $set.SubscriptionEnabled) {
+        Invoke-Exo "Set-UnifiedGroup $grp -SubscriptionEnabled:`$true" { Set-UnifiedGroup -Identity $grp -SubscriptionEnabled:$true -ErrorAction Stop }
+    }
+    $p = @{ Identity = $grp; ErrorAction = 'Stop' }
+    $desc = @()
+    foreach ($k in @($set.Keys)) {
+        if ($k -in 'SubscriptionEnabled', 'HiddenFromAddressListsEnabled') { continue }
+        $p[$k] = $set[$k]
+        $desc += "-$k $(if ($null -eq $set[$k]) { '$null' } elseif ($set[$k] -is [bool]) { "`$$($set[$k])" } else { "'$($set[$k])'" })"
+    }
+    $sob = @{}
+    if (@($D.SobAdd).Count) { $sob.Add = @($D.SobAdd) }
+    if (@($D.SobRemove).Count) { $sob.Remove = @($D.SobRemove) }
+    if ($sob.Count) {
+        $p.GrantSendOnBehalfTo = $sob
+        $sp = @()
+        if ($sob.ContainsKey('Add')) { $sp += "Add=$($sob['Add'] -join ',')" }
+        if ($sob.ContainsKey('Remove')) { $sp += "Remove=$($sob['Remove'] -join ',')" }
+        $desc += "-GrantSendOnBehalfTo @{$($sp -join '; ')}"
+    }
+    if ($p.Count -gt 2) { Invoke-Exo "Set-UnifiedGroup $grp $($desc -join ' ')" { Set-UnifiedGroup @p } }
+    $hideOutlook = ($set.ContainsKey('HiddenFromExchangeClientsEnabled') -and $set.HiddenFromExchangeClientsEnabled)
+    if ($set.ContainsKey('HiddenFromAddressListsEnabled') -and -not $hideOutlook) {
+        $v = [bool]$set.HiddenFromAddressListsEnabled
+        Invoke-Exo "Set-UnifiedGroup $grp -HiddenFromAddressListsEnabled `$$v" { Set-UnifiedGroup -Identity $grp -HiddenFromAddressListsEnabled $v -ErrorAction Stop }
+    }
+    if ($set.ContainsKey('SubscriptionEnabled') -and -not $set.SubscriptionEnabled) {
+        Invoke-Exo "Set-UnifiedGroup $grp -SubscriptionEnabled:`$false" { Set-UnifiedGroup -Identity $grp -SubscriptionEnabled:$false -ErrorAction Stop }
+    }
+    return 'ingesteld'
+}
+
 function Invoke-Queue {
     $todo = @($script:Queue | Where-Object { Test-QueueOpen $_ })
     if ($todo.Count -eq 0) { Show-Msg "De wachtrij is leeg." "Wachtrij" | Out-Null; return }
-    $exo = @($todo | Where-Object { $_.Kind -in 'MbxRight', 'FolderPerm', 'Forward', 'MailContact', 'NewGroup', 'GroupMember' })
+    $exo = @($todo | Where-Object { $_.Kind -in 'MbxRight', 'FolderPerm', 'Forward', 'MailContact', 'NewGroup', 'GroupMember', 'GroupSettings', 'GroupSubscriber' })
     $gr  = @($todo | Where-Object { $_.Kind -in 'GraphPatch', 'GraphManager' })
     if ($exo.Count -and -not $script:ExoConnected) { Show-Msg "De wachtrij bevat $($exo.Count) Exchange-wijziging(en). Verbind eerst met Exchange Online." "Niet verbonden" "OK" "Warning" | Out-Null; return }
     if ($gr.Count -and -not $script:GraphConnected) { Show-Msg "Verbind eerst met Microsoft Graph." "Niet verbonden" "OK" "Warning" | Out-Null; return }
@@ -1055,6 +1143,7 @@ function Invoke-Queue {
             $grant = switch ($it.Kind) {
                 'MbxRight'    { [bool]$it.Data.Grant }
                 'GroupMember' { [bool]$it.Data.Add }
+                'GroupSubscriber' { [bool]$it.Data.Add }
                 'FolderPerm'  { $it.Data.Op -ne 'Remove' }
                 default       { $true }
             }
@@ -1848,7 +1937,7 @@ function Test-AlreadyDone {
     # Fouten die betekenen dat de gewenste situatie al bestaat
     param([string]$Message, [bool]$Grant)
     if ($Grant) { return ($Message -match 'already|bestaat al|has already') }
-    return ($Message -match "isn't present|not present|doesn't exist|does not exist|no existing permission|Could not find|niet gevonden|There is no existing|isn't a member|is not a member")
+    return ($Message -match "isn't present|not present|doesn't exist|does not exist|no existing permission|Could not find|niet gevonden|There is no existing|isn't a member|is not a member|isn't a subscriber|is not a subscriber")
 }
 
 #endregion
@@ -2762,6 +2851,259 @@ function Show-NewGroupDialog {
     return $state.Result
 }
 
+function Get-GroupSettingsOverlay {
+    # Openstaande instellingen-wijzigingen voor 1 M365-groep (latere wint)
+    param([string]$Group)
+    $set = @{}
+    foreach ($it in $script:Queue) {
+        if ((Test-QueueOpen $it) -and $it.Kind -eq 'GroupSettings' -and $it.Data.Group -eq $Group) {
+            foreach ($k in @($it.Data.Set.Keys)) { $set[$k] = $it.Data.Set[$k] }
+        }
+    }
+    return $set
+}
+
+function Show-GroupSettingsDialog {
+    # Instellingen van 1 Microsoft 365-groep: groepsmail in de inbox van leden
+    # (abonneren), extern mailen, privacy, verbergen, beschrijving/MailTip en
+    # verzenden als/namens. Alles via de wachtrij. Geeft het aantal nieuwe
+    # wachtrij-items terug. Handlers vuren tijdens ShowDialog(), dus lokale
+    # variabelen zijn bereikbaar.
+    param([hashtable]$Group, $Owner = $script:Window)
+    $ident = if ($Group.Id) { $Group.Id } else { $Group.Address }
+    $addr = [string]$Group.Address
+    $gname = [string]$Group.Name
+    $Owner.Cursor = [System.Windows.Input.Cursors]::Wait
+    try {
+        $g = @(Invoke-Exo "Get-UnifiedGroup $addr -IncludeAllProperties" { Get-UnifiedGroup -Identity $ident -IncludeAllProperties -ErrorAction Stop }) | Select-Object -First 1
+        $members = @(Invoke-Exo "Get-UnifiedGroupLinks $addr -LinkType Members" { Get-UnifiedGroupLinks -Identity $ident -LinkType Members -ResultSize Unlimited -ErrorAction Stop })
+        $subs = @(Invoke-Exo "Get-UnifiedGroupLinks $addr -LinkType Subscribers" { Get-UnifiedGroupLinks -Identity $ident -LinkType Subscribers -ResultSize Unlimited -ErrorAction Stop })
+        $sendAs = @(try { Invoke-Exo "Get-RecipientPermission $addr -AccessRights SendAs" { Get-RecipientPermission -Identity $addr -AccessRights SendAs -ResultSize Unlimited -ErrorAction Stop } }
+                    catch { Write-Log "Verzenden als ophalen mislukt: $_" "warning" })
+    }
+    catch {
+        Show-Msg "Groep ophalen mislukt:`n$_" "Fout" "OK" "Error" | Out-Null
+        return 0
+    }
+    finally { $Owner.Cursor = $null }
+    if (-not $g) { Show-Msg "Groep $addr niet gevonden." "Fout" "OK" "Error" | Out-Null; return 0 }
+
+    # Leden die nu (of via de wachtrij) geen groepsmail in hun inbox krijgen
+    $subKeys = @{}
+    foreach ($s in $subs) { foreach ($k in @([string]$s.PrimarySmtpAddress, [string]$s.ExternalDirectoryObjectId)) { if ($k) { $subKeys[$k.ToLower()] = $true } } }
+    $subNow = 0
+    foreach ($m in $members) {
+        $sm = ([string]$m.PrimarySmtpAddress).ToLower(); $oid = ([string]$m.ExternalDirectoryObjectId).ToLower()
+        if (($sm -and $subKeys[$sm]) -or ($oid -and $subKeys[$oid])) { $subNow++ }
+    }
+    foreach ($q in @($script:Queue | Where-Object { (Test-QueueOpen $_) -and $_.Kind -eq 'GroupSubscriber' -and $_.Data.Group -eq $addr -and $_.Data.Add })) {
+        foreach ($m in @($q.Data.Members)) { $subKeys[([string]$m).ToLower()] = $true }
+    }
+    $notSub = @(foreach ($m in $members) {
+        $sm = ([string]$m.PrimarySmtpAddress).ToLower(); $oid = ([string]$m.ExternalDirectoryObjectId).ToLower()
+        if (($sm -and $subKeys[$sm]) -or ($oid -and $subKeys[$oid])) { continue }
+        if ($m.PrimarySmtpAddress) { [string]$m.PrimarySmtpAddress } else { [string]$m.ExternalDirectoryObjectId }
+    })
+
+    $w = ConvertFrom-Xaml ($script:GroupSettingsXaml.Replace('{{STYLES}}', $script:StylesXaml))
+    $w.Owner = $Owner
+    $c = @{}
+    foreach ($n in 'GS_LblTitle', 'GS_LblInfo', 'GS_LblSubs', 'GS_ChkSubExisting', 'GS_CmbPrivacy', 'GS_TxtDesc', 'GS_TxtMailTip',
+                   'GS_DelGrid', 'GS_BtnAddSendAs', 'GS_BtnAddSob', 'GS_BtnDelRemove', 'GS_LblChanges', 'GS_BtnOk') { $c[$n] = $w.FindName($n) }
+    foreach ($s in $script:GroupBoolSettings) { $c[$s.Box] = $w.FindName($s.Box) }
+    $state = @{ Orig = @{}; Avail = @{}; Rows = (New-Object System.Collections.ArrayList); Seq = 0; Undo = @(); Result = 0; Setting = $true }
+    $pend = Get-GroupSettingsOverlay $addr
+    $readVal = {
+        param([string]$Name)
+        $pp = $g.PSObject.Properties[$Name]
+        if ($pp) { return $pp.Value }
+    }
+
+    # Aan/uit-instellingen: Exchange-waarde, met wat al in de wachtrij staat erover
+    foreach ($s in $script:GroupBoolSettings) {
+        $box = $c[$s.Box]
+        $v = & $readVal $s.Get
+        if ($v -is [string]) { $v = ($v -eq 'True') }
+        if ($pend.ContainsKey($s.Set)) { $v = $pend[$s.Set] }
+        if ($null -eq $v) { $box.IsEnabled = $false; $box.ToolTip = "Niet beschikbaar (eigenschap $($s.Get) niet gevonden)"; continue }
+        $v = [bool]$v
+        $state.Orig[$s.Set] = $v
+        $state.Avail[$s.Box] = $true
+        $box.IsChecked = $(if ($s.Invert) { -not $v } else { $v })
+    }
+    $acc = [string](& $readVal 'AccessType')
+    if ($pend.ContainsKey('AccessType')) { $acc = [string]$pend.AccessType }
+    $state.Orig.AccessType = $acc
+    $item = @($c.GS_CmbPrivacy.Items | Where-Object { [string]$_.Tag -eq $acc }) | Select-Object -First 1
+    if (-not $item) {
+        $item = New-Object System.Windows.Controls.ComboBoxItem
+        $item.Content = "$acc (hier niet te wijzigen)"; $item.Tag = $acc
+        [void]$c.GS_CmbPrivacy.Items.Add($item)
+        $c.GS_CmbPrivacy.IsEnabled = $false
+    }
+    $c.GS_CmbPrivacy.SelectedItem = $item
+    foreach ($t in @(@{ Prop = 'Notes'; Box = 'GS_TxtDesc' }, @{ Prop = 'MailTip'; Box = 'GS_TxtMailTip' })) {
+        # MailTip komt als HTML terug
+        $v = [System.Net.WebUtility]::HtmlDecode(([string](& $readVal $t.Prop)) -replace '<[^>]+>', '').Trim()
+        if ($pend.ContainsKey($t.Prop)) { $v = [string]$pend[$t.Prop] }
+        $state.Orig[$t.Prop] = $v
+        $c[$t.Box].Text = $v
+    }
+
+    # Verzenden als / namens: huidige stand + wat al in de wachtrij staat
+    $addRow = {
+        param([string]$Naam, [string]$Kind, [string]$Key, [string]$Wachtrij = '', [string]$QKey = '', [bool]$New = $false)
+        $state.Seq++
+        [void]$state.Rows.Add(@{ Nr = [string]$state.Seq; Naam = $Naam; Kind = $Kind; Key = $Key; Wachtrij = $Wachtrij; QKey = $QKey; New = $New; Remove = $false
+                                 Recht = $(if ($Kind -eq 'SendAs') { 'Verzenden als' } else { 'Verzenden namens' }) })
+    }
+    $findRow = {
+        param([string]$Kind, [string]$Key)
+        @($state.Rows | Where-Object { $_.Kind -eq $Kind -and ([string]$_.Key).ToLower() -eq $Key.ToLower() }) | Select-Object -First 1
+    }
+    foreach ($p in $sendAs) {
+        if (-not $p -or $p.Deny -or [string]$p.Trustee -like 'NT AUTHORITY*') { continue }
+        & $addRow ([string]$p.Trustee) 'SendAs' ([string]$p.Trustee)
+    }
+    foreach ($s in @(& $readVal 'GrantSendOnBehalfTo')) { if ($s) { & $addRow ([string]$s) 'SendOnBehalf' ([string]$s) } }
+    foreach ($q in @($script:Queue | Where-Object { Test-QueueOpen $_ })) {
+        if ($q.Kind -eq 'MbxRight' -and $q.Data.Kind -eq 'SendAs' -and $q.Data.Mailbox -eq $addr) {
+            $r = & $findRow 'SendAs' ([string]$q.Data.Who)
+            if ($q.Data.Grant) { if (-not $r) { & $addRow ([string]$q.Data.WhoLabel) 'SendAs' ([string]$q.Data.Who) '+ toevoegen' $q.Key } }
+            elseif ($r) { $r.Wachtrij = '- verwijderen'; $r.QKey = $q.Key }
+        }
+        elseif ($q.Kind -eq 'GroupSettings' -and $q.Data.Group -eq $addr) {
+            foreach ($x in @($q.Data.SobAdd)) { if (-not (& $findRow 'SendOnBehalf' $x)) { & $addRow $x 'SendOnBehalf' $x '+ toevoegen' $q.Key } }
+            foreach ($x in @($q.Data.SobRemove)) { $r = & $findRow 'SendOnBehalf' $x; if ($r) { $r.Wachtrij = '- verwijderen'; $r.QKey = $q.Key } }
+        }
+    }
+
+    $c.GS_LblTitle.Text = "$gname  <$addr>"
+    $own = (@($g.ManagedBy) | Where-Object { $_ } | ForEach-Object { [string]$_ }) -join ', '
+    $c.GS_LblInfo.Text = "Microsoft 365-groep   |   $($members.Count) lid/leden   |   eigenaar(s): $(if ($own) { $own } else { '-' })" +
+        $(if ($pend.Count) { "`nLet op: er staan al instellingen voor deze groep in de wachtrij; die worden hier al getoond." })
+    $c.GS_LblSubs.Text = "Deze twee instellingen gelden alleen voor leden die hierna worden toegevoegd (gasten worden altijd geabonneerd). " +
+        "Nu ontvangen $subNow van $($members.Count) leden de groepsmail in hun eigen inbox; leden kunnen dit zelf aan/uit zetten in Outlook."
+    $c.GS_ChkSubExisting.Content = if ($notSub.Count) { "Ook de $($notSub.Count) huidige lid/leden die nu geen groepsmail in hun inbox krijgen abonneren" }
+                                   else { "Alle huidige leden krijgen de groepsmail al in hun inbox" }
+
+    $collect = {
+        # Gewijzigde instellingen ten opzichte van wat getoond werd
+        $set = @{}; $txt = @()
+        $hideOutlook = [bool]$c.GS_ChkHideOutlook.IsChecked
+        foreach ($s in $script:GroupBoolSettings) {
+            if (-not $state.Orig.ContainsKey($s.Set)) { continue }
+            # Verbergen in Outlook verbergt zelf al in het adresboek
+            if ($s.Set -eq 'HiddenFromAddressListsEnabled' -and $hideOutlook) { continue }
+            $chk = [bool]$c[$s.Box].IsChecked
+            $v = if ($s.Invert) { -not $chk } else { $chk }
+            if ($v -ne [bool]$state.Orig[$s.Set]) { $set[$s.Set] = $v; $txt += "$($s.Label) $(if ($chk) { 'AAN' } else { 'UIT' })" }
+        }
+        $acc = [string]$c.GS_CmbPrivacy.SelectedItem.Tag
+        if ($c.GS_CmbPrivacy.IsEnabled -and $acc -and $acc -ne $state.Orig.AccessType) {
+            $set.AccessType = $acc
+            $txt += "Privacy: $(if ($acc -eq 'Private') { "priv$([char]0x00E9)" } else { 'openbaar' })"
+        }
+        foreach ($t in @(@{ Prop = 'Notes'; Box = 'GS_TxtDesc'; Label = 'Beschrijving' }, @{ Prop = 'MailTip'; Box = 'GS_TxtMailTip'; Label = 'MailTip' })) {
+            $v = $c[$t.Box].Text.Trim()
+            if ($v -cne [string]$state.Orig[$t.Prop]) {
+                $set[$t.Prop] = $(if ($v) { $v } else { $null })
+                $txt += $(if ($v) { "$($t.Label): '$v'" } else { "$($t.Label) LEEGMAKEN" })
+            }
+        }
+        return @{ Set = $set; Text = @($txt) }
+    }
+    $updateChanges = {
+        if ($state.Setting) { return }
+        $x = & $collect
+        $n = $x.Text.Count + @($state.Rows | Where-Object { $_.New -or $_.Remove }).Count + @($state.Undo).Count
+        if ($c.GS_ChkSubExisting.IsChecked) { $n++ }
+        $c.GS_LblChanges.Text = if ($n) { "$n wijziging(en) - gaan pas door na 'Alles uitvoeren'" } else { 'Geen wijzigingen' }
+        $c.GS_BtnOk.IsEnabled = ($n -gt 0)
+    }
+    $updateDeps = {
+        # Afhankelijkheden tussen de opties
+        $state.Setting = $true
+        $subOk = (-not $state.Avail['GS_ChkSubEnabled']) -or [bool]$c.GS_ChkSubEnabled.IsChecked
+        if ($state.Avail['GS_ChkAutoSub']) {
+            if (-not $subOk) { $c.GS_ChkAutoSub.IsChecked = $false }
+            $c.GS_ChkAutoSub.IsEnabled = $subOk
+        }
+        if ($state.Avail['GS_ChkCalSub']) { $c.GS_ChkCalSub.IsEnabled = ($subOk -and -not $c.GS_ChkAutoSub.IsChecked) }
+        if (-not $subOk) { $c.GS_ChkSubExisting.IsChecked = $false }
+        $c.GS_ChkSubExisting.IsEnabled = ($subOk -and $notSub.Count -gt 0)
+        if ($state.Avail['GS_ChkHideGal']) {
+            $ho = [bool]$c.GS_ChkHideOutlook.IsChecked
+            if ($ho) { $c.GS_ChkHideGal.IsChecked = $true }
+            $c.GS_ChkHideGal.IsEnabled = (-not $ho)
+        }
+        $state.Setting = $false
+        & $updateChanges
+    }
+    $renderDel = {
+        Set-GridRows $c.GS_DelGrid @('Nr', 'Naam', 'Recht', 'Wachtrij') @($state.Rows)
+        & $updateChanges
+    }
+    $addDel = {
+        param([string]$Kind)
+        $ex = @{}
+        $ex[$addr.ToLower()] = $true
+        foreach ($r in $state.Rows) { if ($r.Kind -eq $Kind) { $ex[([string]$r.Key).ToLower()] = $true } }
+        $what = if ($Kind -eq 'SendAs') { 'Verzenden als' } else { 'Verzenden namens' }
+        $sel = @(Show-RecipientPicker -Title "$what $gname" -Owner $w -Allow @('UserMailbox', 'SharedMailbox', 'MailUser', 'MailUniversalSecurityGroup') -Exclude $ex `
+            -Prompt "Wie mag '$what' de groep $gname mailen? Alleen mailboxen, mailgebruikers en beveiligingsgroepen met e-mail kunnen dit recht krijgen.")
+        foreach ($s in $sel) { if ($s) { & $addRow ([string]$s.Label) $Kind ([string]$s.Value) '+ toevoegen' '' $true } }
+        & $renderDel
+    }
+    $removeDel = {
+        $sel = @(Get-SelectedRows $c.GS_DelGrid)
+        if (-not $sel.Count) { Show-Msg "Selecteer eerst een of meer regels." "Verwijderen" | Out-Null; return }
+        foreach ($dr in $sel) {
+            $r = @($state.Rows | Where-Object { $_.Nr -eq [string]$dr['Nr'] }) | Select-Object -First 1
+            if (-not $r) { continue }
+            if ($r.New) { $state.Rows.Remove($r) }                                                   # net toegevoegd: weer weg
+            elseif ($r.Wachtrij -eq '+ toevoegen') { $state.Undo += $r.QKey; $state.Rows.Remove($r) } # stond al in de wachtrij: item schrappen
+            elseif ($r.Remove) { $r.Remove = $false; $r.Wachtrij = '' }                              # verwijderen ongedaan maken
+            elseif (-not $r.Wachtrij) { $r.Remove = $true; $r.Wachtrij = '- verwijderen' }
+        }
+        & $renderDel
+    }
+    $submit = {
+        $x = & $collect
+        $n = 0
+        if ($x.Text.Count -and (Add-GroupSettingsToQueue -GroupName $gname -Group $addr -Set $x.Set -Text "Instellingen $addr`: $($x.Text -join '; ')")) { $n++ }
+        if ($c.GS_ChkSubExisting.IsChecked -and $notSub.Count) {
+            if (Add-GroupSubscriberToQueue -GroupName $gname -Group $addr -Members $notSub -Label "$($notSub.Count) huidige lid/leden" -Add $true) { $n++ }
+        }
+        foreach ($r in @($state.Rows)) {
+            if (-not ($r.New -or $r.Remove)) { continue }
+            $grant = [bool]$r.New
+            $ok = if ($r.Kind -eq 'SendAs') { Add-MbxRightToQueue -Target $gname -Kind 'SendAs' -Mailbox $addr -Who $r.Key -WhoLabel $r.Naam -Grant $grant }
+                  elseif ($grant) { Add-GroupSettingsToQueue -GroupName $gname -Group $addr -SobAdd @($r.Key) -Text "Verzenden namens groep $addr TOEKENNEN aan $($r.Naam)" }
+                  else { Add-GroupSettingsToQueue -GroupName $gname -Group $addr -SobRemove @($r.Key) -Text "Verzenden namens groep $addr INTREKKEN voor $($r.Naam)" }
+            if ($ok) { $n++ }
+        }
+        if (@($state.Undo).Count) { [void](Remove-QueueItems $state.Undo) }
+        Update-QueueSummary
+        $state.Result = $n
+        $w.DialogResult = $true
+    }
+
+    foreach ($s in $script:GroupBoolSettings) { $c[$s.Box].Add_Click($updateDeps) }
+    $c.GS_ChkSubExisting.Add_Click($updateChanges)
+    $c.GS_CmbPrivacy.Add_SelectionChanged($updateChanges)
+    $c.GS_TxtDesc.Add_TextChanged($updateChanges)
+    $c.GS_TxtMailTip.Add_TextChanged($updateChanges)
+    $c.GS_BtnAddSendAs.Add_Click({ & $addDel 'SendAs' })
+    $c.GS_BtnAddSob.Add_Click({ & $addDel 'SendOnBehalf' })
+    $c.GS_BtnDelRemove.Add_Click($removeDel)
+    $c.GS_BtnOk.Add_Click($submit)
+    & $renderDel
+    & $updateDeps
+    [void]$w.ShowDialog()
+    return [int]$state.Result
+}
+
 function Show-RecipientOverview {
     # Alle ontvangers met een mailadres: mailboxen, groepen, distributielijsten,
     # contactpersonen en mailgebruikers, met groepsleden beheren en
@@ -2773,11 +3115,12 @@ function Show-RecipientOverview {
     $c = @{}
     foreach ($n in 'RO_BtnLoad', 'RO_TxtFilter', 'RO_CmbCat', 'RO_ChkHidden', 'RO_LblStatus', 'RO_Grid', 'RO_LblMembers', 'RO_MemberGrid',
                    'RO_BtnMembers', 'RO_BtnOpen', 'RO_BtnExport', 'RO_BtnExportMembers', 'RO_BtnNewContact', 'RO_BtnNewGroup',
-                   'RO_BtnAddPick', 'RO_BtnAddPaste', 'RO_BtnRemove') { $c[$n] = $w.FindName($n) }
+                   'RO_BtnAddPick', 'RO_BtnAddPaste', 'RO_BtnRemove', 'RO_BtnSettings', 'RO_BtnSubOn', 'RO_BtnSubOff') { $c[$n] = $w.FindName($n) }
     $state = @{ Table = $null; Members = $null; MemberData = $null; Group = $null; Added = 0 }
     $cols = @('Naam', 'Adres', 'Type', 'Categorie', 'Bron', 'Aliassen', 'Extern', 'Beheerder', 'Verborgen', 'Doorsturen', 'Wachtrij', 'Id', 'RType')
-    $mcols = @('Naam', 'Adres', 'Type', 'Wachtrij', 'Key', 'QKey')
-    foreach ($b in 'RO_BtnMembers', 'RO_BtnOpen', 'RO_BtnExport', 'RO_BtnExportMembers', 'RO_BtnAddPick', 'RO_BtnAddPaste', 'RO_BtnRemove') { $c[$b].IsEnabled = $false }
+    $mcols = @('Naam', 'Adres', 'Type', 'Inbox', 'Wachtrij', 'Key', 'QKey')
+    $inboxCol = @($c.RO_MemberGrid.Columns | Where-Object { [string]$_.Header -eq 'Inbox' }) | Select-Object -First 1
+    foreach ($b in 'RO_BtnMembers', 'RO_BtnSettings', 'RO_BtnOpen', 'RO_BtnExport', 'RO_BtnExportMembers', 'RO_BtnAddPick', 'RO_BtnAddPaste', 'RO_BtnRemove') { $c[$b].IsEnabled = $false }
 
     $applyFilter = {
         if (-not $state.Table) { return }
@@ -2885,6 +3228,7 @@ function Show-RecipientOverview {
     $onSel = {
         $r = & $selected
         $c.RO_BtnMembers.IsEnabled = [bool]($r -and $r['Categorie'] -eq 'Groep' -and -not $r['Wachtrij'])
+        $c.RO_BtnSettings.IsEnabled = [bool]($r -and $r['RType'] -eq 'GroupMailbox' -and -not $r['Wachtrij'])
         $c.RO_BtnOpen.IsEnabled = [bool]($r -and $r['Id'] -and $script:UserTable -and $script:UserTable.Select("Id = '$($r['Id'])'").Count)
     }
     $renderMembers = {
@@ -2892,28 +3236,41 @@ function Show-RecipientOverview {
         $g = $state.Group
         $rows = New-Object System.Collections.ArrayList
         $byKey = @{}
+        $m365 = ($g.Type -eq 'GroupMailbox')
         foreach ($m in $state.MemberData) {
-            $row = @{ Naam = $m.Naam; Adres = $m.Adres; Type = $m.Type; Key = $m.Key; Wachtrij = ''; QKey = '' }
+            $row = @{ Naam = $m.Naam; Adres = $m.Adres; Type = $m.Type; Key = $m.Key; Inbox = $m.Inbox; Wachtrij = ''; QKey = '' }
             [void]$rows.Add($row)
-            foreach ($k in @($m.Key, $m.Adres)) { if ($k) { $byKey[$k.ToLower()] = $row } }
+            foreach ($k in @($m.Key, $m.Adres, $m.Id)) { if ($k) { $byKey[$k.ToLower()] = $row } }
+        }
+        # Groepsmail in de inbox (abonnees) die in de wachtrij staat
+        foreach ($q in @($script:Queue | Where-Object { (Test-QueueOpen $_) -and $_.Kind -eq 'GroupSubscriber' -and $_.Data.Group -eq $g.Address })) {
+            foreach ($mk in @($q.Data.Members)) {
+                $k = ([string]$mk).ToLower()
+                if ($byKey.ContainsKey($k)) { $byKey[$k].Inbox = $(if ($q.Data.Add) { '+ aan' } else { '- uit' }) }
+            }
         }
         foreach ($q in @($script:Queue | Where-Object { (Test-QueueOpen $_) -and $_.Kind -eq 'GroupMember' -and $_.Data.Group -eq $g.Address })) {
             $k = ([string]$q.Data.Member).ToLower()
             if ($q.Data.Add) {
                 if ($byKey.ContainsKey($k)) { continue }
-                $row = @{ Naam = $q.Data.MemberLabel; Adres = $q.Data.Member; Type = ''; Key = $q.Data.Member; Wachtrij = '+ toevoegen'; QKey = $q.Key }
+                $row = @{ Naam = $q.Data.MemberLabel; Adres = $q.Data.Member; Type = ''; Key = $q.Data.Member; Inbox = ''; Wachtrij = '+ toevoegen'; QKey = $q.Key }
                 [void]$rows.Add($row); $byKey[$k] = $row
             }
             elseif ($byKey.ContainsKey($k)) { $byKey[$k].Wachtrij = '- verwijderen'; $byKey[$k].QKey = $q.Key }
         }
         $state.Members = Set-GridRows $c.RO_MemberGrid $mcols $rows -PassThru
         $state.Members.DefaultView.Sort = 'Naam'
-        $nq = @($rows | Where-Object { $_.Wachtrij }).Count
-        $c.RO_LblMembers.Text = "$($state.MemberData.Count) lid/leden van $($g.Name)$(if ($nq) { "  ($nq wijziging(en) in wachtrij)" })$(if ($g.Why) { "`nAlleen-lezen: $($g.Why)" })"
+        $nq = @($rows | Where-Object { $_.Wachtrij -or $_.Inbox -like '[+-]*' }).Count
+        $subTxt = if ($m365) { "`n$(@($state.MemberData | Where-Object { $_.Inbox -eq 'Ja' }).Count) van $($state.MemberData.Count) krijgen de groepsmail in hun eigen inbox (kolom Inbox)" } else { '' }
+        $c.RO_LblMembers.Text = "$($state.MemberData.Count) lid/leden van $($g.Name)$(if ($nq) { "  ($nq wijziging(en) in wachtrij)" })$subTxt$(if ($g.Why) { "`nAlleen-lezen: $($g.Why)" })"
         $edit = -not $g.Why
         $c.RO_BtnAddPick.IsEnabled = $edit
         $c.RO_BtnAddPaste.IsEnabled = $edit
         $c.RO_BtnRemove.IsEnabled = $edit
+        $vis = if ($m365) { 'Visible' } else { 'Collapsed' }
+        if ($inboxCol) { $inboxCol.Visibility = $vis }
+        $c.RO_BtnSubOn.Visibility = $vis
+        $c.RO_BtnSubOff.Visibility = $vis
         $c.RO_BtnExportMembers.IsEnabled = ($rows.Count -gt 0)
     }
     $existingMembers = {
@@ -2929,10 +3286,19 @@ function Show-RecipientOverview {
             $g = & $groupInfo $r
             $c.RO_LblMembers.Text = "Leden van $($g.Name) ophalen..."; Update-UI
             $ident = if ($g.Id) { $g.Id } else { $g.Address }
+            # M365-groep: wie krijgt de groepsmail in de eigen inbox (abonnees)
+            $subKeys = @{}
+            if ($g.Type -eq 'GroupMailbox') {
+                foreach ($s in @(Invoke-Exo "Get-UnifiedGroupLinks $($g.Address) -LinkType Subscribers" { Get-UnifiedGroupLinks -Identity $ident -LinkType Subscribers -ResultSize Unlimited -ErrorAction Stop })) {
+                    foreach ($k in @([string]$s.PrimarySmtpAddress, [string]$s.ExternalDirectoryObjectId)) { if ($k) { $subKeys[$k.ToLower()] = $true } }
+                }
+            }
             $data = foreach ($m in (Get-RecipientMembers $ident $g.Type)) {
                 $smtp = [string]$m.PrimarySmtpAddress
-                $key = if ($smtp) { $smtp } elseif ($m.ExternalDirectoryObjectId) { [string]$m.ExternalDirectoryObjectId } else { [string]$m.Name }
-                [pscustomobject]@{ Naam = [string]$m.DisplayName; Adres = $smtp; Type = (Get-RecipientTypeInfo ([string]$m.RecipientTypeDetails)).Label; Key = $key }
+                $oid = [string]$m.ExternalDirectoryObjectId
+                $key = if ($smtp) { $smtp } elseif ($oid) { $oid } else { [string]$m.Name }
+                $inbox = if ($g.Type -ne 'GroupMailbox') { '' } elseif (($smtp -and $subKeys[$smtp.ToLower()]) -or ($oid -and $subKeys[$oid.ToLower()])) { 'Ja' } else { 'Nee' }
+                [pscustomobject]@{ Naam = [string]$m.DisplayName; Adres = $smtp; Type = (Get-RecipientTypeInfo ([string]$m.RecipientTypeDetails)).Label; Key = $key; Id = $oid; Inbox = $inbox }
             }
             $state.Group = $g
             $state.MemberData = @($data)
@@ -3030,6 +3396,42 @@ function Show-RecipientOverview {
         catch { Show-Msg "Exporteren mislukt:`n$_" "Fout" "OK" "Error" | Out-Null }
     }
 
+    $setSubscription = {
+        # Groepsmail in de eigen inbox aan/uit voor de geselecteerde leden (M365-groep)
+        param([bool]$On)
+        $g = $state.Group
+        if (-not $g -or $g.Type -ne 'GroupMailbox' -or $g.Why) { return }
+        $rows = @(Get-SelectedRows $c.RO_MemberGrid)
+        if ($rows.Count -eq 0) { Show-Msg "Selecteer eerst een of meer leden (Ctrl/Shift-klik)." "Groepsmail in inbox" | Out-Null; return }
+        $want = if ($On) { 'Nee' } else { 'Ja' }
+        $pick = @($rows | Where-Object { [string]$_['Inbox'] -eq $want -and -not $_['Wachtrij'] })
+        if ($pick.Count -eq 0) {
+            Show-Msg "Geen van de geselecteerde leden $(if ($On) { 'kan worden aangezet (staat al aan, in de wachtrij of nog niet uitgevoerd)' } else { 'krijgt de groepsmail nu in de inbox' })." "Groepsmail in inbox" | Out-Null
+            return
+        }
+        $n = 0
+        foreach ($r in $pick) {
+            if (Add-GroupSubscriberToQueue -GroupName $g.Name -Group $g.Address -Members @([string]$r['Key']) -Label "$($r['Naam']) <$($r['Adres'])>" -Add $On) { $n++ }
+        }
+        $state.Added += $n
+        Update-QueueSummary
+        & $renderMembers
+        $c.RO_LblStatus.Text = "Groepsmail in inbox $(if ($On) { 'aanzetten' } else { 'uitzetten' }) voor $n lid/leden in de wachtrij gezet"
+    }
+    $openSettings = {
+        $r = & $selected
+        if (-not $r -or $r['RType'] -ne 'GroupMailbox' -or $r['Wachtrij']) { return }
+        $g = & $groupInfo $r
+        $n = [int](@(Show-GroupSettingsDialog -Group $g -Owner $w) | Select-Object -Last 1)
+        if (-not $n) { return }
+        $state.Added += $n
+        $c.RO_LblStatus.Text = "$n groepsinstelling(en) voor $($g.Name) in de wachtrij gezet. Wordt uitgevoerd bij 'Alles uitvoeren' of bij het sluiten van dit venster."
+        if ($state.Group -and $state.Group.Address -eq $g.Address) { & $renderMembers }
+    }
+
+    $c.RO_BtnSettings.Add_Click($openSettings)
+    $c.RO_BtnSubOn.Add_Click({ & $setSubscription $true })
+    $c.RO_BtnSubOff.Add_Click({ & $setSubscription $false })
     $c.RO_BtnLoad.Add_Click($load)
     $c.RO_TxtFilter.Add_TextChanged($applyFilter)
     $c.RO_CmbCat.Add_SelectionChanged($applyFilter)
@@ -5091,6 +5493,8 @@ $script:RcptOverviewXaml = @'
       <Button x:Name="RO_BtnExport" DockPanel.Dock="Right" Content="Exporteren naar CSV..." Style="{StaticResource BtnGray}" Margin="8,0,0,6"/>
       <WrapPanel>
         <Button x:Name="RO_BtnMembers" Content="Leden tonen"/>
+        <Button x:Name="RO_BtnSettings" Content="Groepsinstellingen..."
+                ToolTip="Microsoft 365-groep: groepsmail in de inbox van leden, extern mailen, privacy, verbergen, MailTip en verzenden als/namens. Via de wachtrij."/>
         <Button x:Name="RO_BtnOpen" Content="Openen in gebruikerslijst" Style="{StaticResource BtnGreen}"/>
         <Button x:Name="RO_BtnNewGroup" Content="Nieuwe groep / lijst..." Style="{StaticResource BtnGreen}" Margin="0,0,8,6" Padding="12,6"
                 ToolTip="Distributielijst, beveiligingsgroep met e-mail, Microsoft 365-groep, dynamische distributielijst of ruimtelijst aanmaken, met eigenaren en leden. Via de wachtrij."/>
@@ -5131,12 +5535,17 @@ $script:RcptOverviewXaml = @'
                   ToolTip="Meerdere adressen in 1 keer (uit Outlook/Excel). Externe adressen krijgen eerst automatisch een contactpersoon."/>
           <Button x:Name="RO_BtnRemove" Content="Verwijderen" Style="{StaticResource BtnRed}" Padding="10,4"
                   ToolTip="Geselecteerde leden uit de groep halen (via de wachtrij). Bij een lid met '+ toevoegen' wordt alleen het wachtrij-item geschrapt."/>
+          <Button x:Name="RO_BtnSubOn" Content="Groepsmail in inbox aan" Padding="10,4" Visibility="Collapsed"
+                  ToolTip="Geselecteerde leden krijgen de mail en afspraken van de M365-groep in hun eigen inbox (abonneren, via de wachtrij)"/>
+          <Button x:Name="RO_BtnSubOff" Content="Groepsmail in inbox uit" Style="{StaticResource BtnGray}" Padding="10,4" Visibility="Collapsed"
+                  ToolTip="Geselecteerde leden krijgen de groepsmail niet meer in hun eigen inbox (blijven wel lid)"/>
         </WrapPanel>
         <DataGrid x:Name="RO_MemberGrid" SelectionMode="Extended">
           <DataGrid.Columns>
             <DataGridTextColumn Header="Naam"     Binding="{Binding Naam}"     Width="*"   ElementStyle="{StaticResource CellText}"/>
             <DataGridTextColumn Header="Adres"    Binding="{Binding Adres}"    Width="*"   ElementStyle="{StaticResource CellText}"/>
             <DataGridTextColumn Header="Type"     Binding="{Binding Type}"     Width="100" ElementStyle="{StaticResource CellText}"/>
+            <DataGridTextColumn Header="Inbox"    Binding="{Binding Inbox}"    Width="85"  ElementStyle="{StaticResource CellText}" Visibility="Collapsed"/>
             <DataGridTextColumn Header="Wachtrij" Binding="{Binding Wachtrij}" Width="95"  ElementStyle="{StaticResource CellQueue}"/>
           </DataGrid.Columns>
         </DataGrid>
@@ -5309,6 +5718,95 @@ $script:NewGroupXaml = @'
             </DockPanel>
           </GroupBox>
         </Grid>
+      </StackPanel>
+    </ScrollViewer>
+  </DockPanel>
+</Window>
+'@
+
+$script:GroupSettingsXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Microsoft 365-groep - instellingen" Width="780" Height="860" MinWidth="620" MinHeight="500" WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False" Background="#F5F5F5" FontFamily="Segoe UI" FontSize="12">
+  <Window.Resources>
+{{STYLES}}
+    <Style TargetType="CheckBox"><Setter Property="Margin" Value="0,0,0,6"/></Style>
+  </Window.Resources>
+  <DockPanel Margin="14">
+    <StackPanel DockPanel.Dock="Top">
+      <TextBlock x:Name="GS_LblTitle" FontSize="15" FontWeight="SemiBold" TextWrapping="Wrap"/>
+      <TextBlock x:Name="GS_LblInfo" Style="{StaticResource Hint}" Margin="0,2,0,8"/>
+    </StackPanel>
+    <DockPanel DockPanel.Dock="Bottom" Margin="0,8,0,0">
+      <Button DockPanel.Dock="Right" Content="Annuleren" Style="{StaticResource BtnGray}" IsCancel="True" Margin="8,0,0,6"/>
+      <Button x:Name="GS_BtnOk" DockPanel.Dock="Right" Content="Naar wachtrij" Style="{StaticResource BtnGreen}" Margin="8,0,0,6"/>
+      <TextBlock x:Name="GS_LblChanges" VerticalAlignment="Center" Foreground="#0063B1" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,6"/>
+    </DockPanel>
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+      <StackPanel Margin="0,0,6,0">
+        <GroupBox Header="Groepsmail in de inbox van de leden">
+          <StackPanel>
+            <CheckBox x:Name="GS_ChkAutoSub" Content="Kopie&#235;n van groepsmail en -afspraken naar de inbox van nieuwe leden sturen"
+                      ToolTip="AutoSubscribeNewMembers. Zelfde als 'Send copies of group conversations and events to group members inboxes' in het admin center."/>
+            <CheckBox x:Name="GS_ChkCalSub" Content="Alleen groepsafspraken in de agenda van nieuwe leden (zonder de mail)"
+                      ToolTip="AlwaysSubscribeMembersToCalendarEvents. Werkt alleen als de optie hierboven uit staat."/>
+            <TextBlock x:Name="GS_LblSubs" Style="{StaticResource Hint}" Margin="20,0,0,6"/>
+            <CheckBox x:Name="GS_ChkSubExisting" FontWeight="SemiBold"
+                      ToolTip="Zet de huidige leden als abonnee (Add-UnifiedGroupLinks -LinkType Subscribers). Per lid aan/uit kan ook in het ledenpaneel."/>
+            <CheckBox x:Name="GS_ChkWelcome" Content="Welkomstmail sturen naar nieuwe leden" ToolTip="UnifiedGroupWelcomeMessageEnabled"/>
+            <CheckBox x:Name="GS_ChkSubEnabled" Content="Abonneren toegestaan (uit = niemand kan de groepsmail in de eigen inbox aanzetten)"
+                      ToolTip="SubscriptionEnabled. Normaal aan laten staan."/>
+          </StackPanel>
+        </GroupBox>
+        <GroupBox Header="Afzenders">
+          <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+            <CheckBox x:Name="GS_ChkExternal" Grid.ColumnSpan="2" Content="Mensen buiten de organisatie mogen naar de groep mailen"
+                      ToolTip="RequireSenderAuthenticationEnabled uit. Standaard mag alleen intern."/>
+            <TextBlock Grid.Row="1" Text="MailTip:" Style="{StaticResource FieldLabel}"/>
+            <TextBox x:Name="GS_TxtMailTip" Grid.Row="1" Grid.Column="1" Style="{StaticResource FieldBox}"
+                     ToolTip="Melding die afzenders in Outlook zien als ze naar deze groep mailen. Leeg = geen MailTip."/>
+          </Grid>
+        </GroupBox>
+        <GroupBox Header="Privacy en zichtbaarheid">
+          <StackPanel>
+            <WrapPanel>
+              <TextBlock Text="Privacy:" Style="{StaticResource FieldLabel}"/>
+              <ComboBox x:Name="GS_CmbPrivacy" Width="380" Margin="0,0,0,6">
+                <ComboBoxItem Content="Priv&#233; - alleen leden zien de inhoud, eigenaar keurt nieuwe leden goed" Tag="Private"/>
+                <ComboBoxItem Content="Openbaar - iedereen in de organisatie kan de inhoud zien en lid worden" Tag="Public"/>
+              </ComboBox>
+            </WrapPanel>
+            <CheckBox x:Name="GS_ChkHideGal" Content="Verbergen in het adresboek (GAL)"/>
+            <CheckBox x:Name="GS_ChkHideOutlook" Content="Verbergen in Outlook (niet in de groepenlijst en niet te vinden; mail naar de groep komt wel binnen)"
+                      ToolTip="HiddenFromExchangeClientsEnabled. Verbergt automatisch ook in het adresboek. Leden zien dan ook de abonneer-optie niet."/>
+            <CheckBox x:Name="GS_ChkCalRO" Content="Leden hebben alleen leesrechten op de groepsagenda" ToolTip="CalendarMemberReadOnly"/>
+          </StackPanel>
+        </GroupBox>
+        <GroupBox Header="Beschrijving">
+          <TextBox x:Name="GS_TxtDesc" Height="54" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" Padding="4,2"/>
+        </GroupBox>
+        <GroupBox Header="Verzenden als / namens de groep">
+          <StackPanel>
+            <TextBlock Style="{StaticResource Hint}"
+                       Text="Verzenden als: de ontvanger ziet alleen de groep als afzender. Verzenden namens: 'Naam namens Groep'. Leden hebben dit niet automatisch; antwoorden komen in de groep."/>
+            <DataGrid x:Name="GS_DelGrid" Height="140" SelectionMode="Extended">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Naam"     Binding="{Binding Naam}"     Width="*"   ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Recht"    Binding="{Binding Recht}"    Width="130" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Wachtrij" Binding="{Binding Wachtrij}" Width="100" ElementStyle="{StaticResource CellQueue}"/>
+              </DataGrid.Columns>
+            </DataGrid>
+            <WrapPanel Margin="0,6,0,0">
+              <Button x:Name="GS_BtnAddSendAs" Content="Verzenden als toevoegen..." Style="{StaticResource BtnGreen}" Padding="10,4"/>
+              <Button x:Name="GS_BtnAddSob" Content="Verzenden namens toevoegen..." Style="{StaticResource BtnGreen}" Padding="10,4"/>
+              <Button x:Name="GS_BtnDelRemove" Content="Verwijderen" Style="{StaticResource BtnRed}" Padding="10,4"
+                      ToolTip="Geselecteerde rechten intrekken (via de wachtrij). Nog een keer klikken maakt het ongedaan."/>
+            </WrapPanel>
+          </StackPanel>
+        </GroupBox>
       </StackPanel>
     </ScrollViewer>
   </DockPanel>
