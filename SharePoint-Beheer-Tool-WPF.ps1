@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     SharePoint Beheer (WPF) - overzicht van alle sites, OneDrives, bibliotheken
@@ -20,13 +20,15 @@
                                              geven/intrekken, versielimiet, versies
                                              opschonen.
                          Bulk: toegang geven/intrekken, extern delen, quotum,
-                         vergrendeling, versies opschonen, prullenbak legen,
-                         machtigingenrapport, groepen scannen.
+                         vergrendeling, versies opschonen, prullenbak terugzetten
+                         (filter op wie/wanneer/type) of legen, machtigingenrapport,
+                         groepen scannen.
       OneDrive           alle OneDrives: eigenaar, status account (actief/uit/
                          verwijderd), gebruikt/quotum/%, bestanden, activiteit,
                          prullenbak, versies. Bulk: beheerder toevoegen/verwijderen
                          (bijv. manager bij uitdienst), quotum, vergrendeling,
-                         versies opschonen, prullenbak legen, OneDrive leegmaken.
+                         versies opschonen, prullenbak terugzetten of legen,
+                         OneDrive leegmaken.
       Gebruiker-toegang  waar heeft iemand toegang (site, bibliotheek, via groep,
                          via 'Iedereen'), optioneel ook in OneDrives.
       Groepen            Entra-groepen in sites, statisch/dynamisch, groep-editor.
@@ -2111,6 +2113,177 @@ function Invoke-BulkRecycle {
     Set-Status "Prullenbak: $ok geleegd, $fail mislukt" $(if ($fail) { 'error' } else { 'success' })
 }
 
+# --- Prullenbak terugzetten ---
+
+$script:RecycleTypeLabels = @{
+    1 = 'Bestand'; 2 = 'Bestandsversie'; 3 = 'Lijstitem'; 4 = 'Lijst/bibliotheek'; 5 = 'Map'; 6 = 'Map'
+    7 = 'Bijlage'; 8 = 'Itemversie'; 9 = 'Overig'; 10 = 'Subsite'; 11 = 'App'
+}
+
+function Get-RecycleItemsCore {
+    # Alle items uit de prullenbak van de sitecollectie (1e fase van alle webs + 2e fase).
+    # Pagineert via GetRecycleBinItems; lukt dat niet, dan terugval op de eerste 5000.
+    param($Site, [int]$Max = 100000)
+    $sel = 'Id,Title,LeafName,DirName,ItemType,ItemState,DeletedDate,DeletedByName,DeletedByEmail,AuthorName,Size'
+    $all = New-Object System.Collections.ArrayList
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $paging = ''
+    $paged = $true
+    $capped = $false
+    while (-not $script:StopRequested) {
+        $page = @()
+        if ($paged) {
+            try {
+                $pi = [uri]::EscapeDataString($paging.Replace("'", "''"))
+                $page = @((Invoke-SP "$($Site.Url)/_api/site/GetRecycleBinItems(pagingInfo='$pi',rowLimit=5000,isAscending=true,orderBy=1,itemState=0)?`$select=$sel" -Quiet).value)
+            }
+            catch {
+                if ($paging) { Write-Log "$($Site.Title): volgende pagina prullenbak mislukt ($($_.Exception.Message)) - lijst is onvolledig" 'warning'; $capped = $true; break }
+                if (Test-AccessDenied $_) { throw }
+                $paged = $false
+            }
+        }
+        if (-not $paged) { $page = @((Invoke-SP "$($Site.Url)/_api/site/RecycleBin?`$select=$sel&`$top=5000" -Quiet).value) }
+        $new = 0
+        foreach ($i in $page) { if ($i -and $seen.Add([string]$i.Id)) { [void]$all.Add($i); $new++ } }
+        if ($page.Count -lt 5000) { break }
+        if (-not $paged -or $new -eq 0 -or $all.Count -ge $Max) { $capped = $true; break }
+        Set-Status "Prullenbak $($Site.Title): $($all.Count) items..."
+        $last = $page[$page.Count - 1]
+        $paging = "id=$($last.Id)&title=$([uri]::EscapeDataString([string]$last.Title))"
+    }
+    if ($capped) { Write-Log "$($Site.Title): prullenbak heeft meer dan $($all.Count) items - niet alles is opgehaald" 'warning' }
+    return ,$all.ToArray()
+}
+
+function ConvertFrom-RecycleItem {
+    param($Item, $Site, [int]$SiteKey)
+    $dt = [datetime]::MinValue
+    if ($Item.DeletedDate) {
+        try { $dt = ([datetime]::Parse([string]$Item.DeletedDate, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime() } catch { }
+    }
+    $type = [int]$Item.ItemType
+    $name = [string]$Item.LeafName
+    if (-not $name) { $name = [string]$Item.Title }
+    return @{
+        Id = [string]$Item.Id; SiteKey = $SiteKey; Site = [string]$Site.Title; SiteUrl = $Site.Url
+        Name = $name; Dir = [string]$Item.DirName; ItemType = $type
+        Type = $(if ($script:RecycleTypeLabels.ContainsKey($type)) { $script:RecycleTypeLabels[$type] } else { "Type $type" })
+        Stage = $(if ([int]$Item.ItemState -eq 2) { '2e fase' } else { '1e fase' })
+        By = $(if ($Item.DeletedByName) { [string]$Item.DeletedByName } else { [string]$Item.DeletedByEmail })
+        ByEmail = [string]$Item.DeletedByEmail; Author = [string]$Item.AuthorName
+        Deleted = $dt; SizeMB = [Math]::Round(([double](ConvertTo-Num $Item.Size)) / 1MB, 2)
+    }
+}
+
+function Restore-RecycleItemsCore {
+    # Zet items terug; containers (subsites, lijsten, mappen) eerst, ondiepe paden eerst.
+    param($Site, $Items)
+    $ok = 0; $failed = New-Object System.Collections.ArrayList
+    $order = @($Items | Sort-Object @{ Expression = { if ($_.ItemType -in 10, 4, 5, 6) { 0 } else { 1 } } }, @{ Expression = { $_.Dir.Length } }, @{ Expression = { $_.Name } })
+    $base = "$($Site.Url)/_api/site/RecycleBin"
+    $useBatch = $true
+    for ($i = 0; $i -lt $order.Count; $i += 50) {
+        if ($script:StopRequested) { break }
+        $chunk = @($order[$i..([Math]::Min($i + 49, $order.Count - 1))])
+        Set-Status "Terugzetten $($Site.Title): $([Math]::Min($i + 50, $order.Count)) van $($order.Count)..."
+        if ($useBatch -and $chunk.Count -gt 1) {
+            try {
+                [void](Invoke-SP "$base/RestoreByIds" -Method POST -Body @{ ids = @($chunk | ForEach-Object { $_.Id }) } -Quiet)
+                $ok += $chunk.Count
+                continue
+            }
+            catch {
+                if (Test-AccessDenied $_) { throw }
+                if ($_.Exception.Message -match 'RestoreByIds|does not exist on type|bestaat niet op type|\[404\]') { $useBatch = $false }
+                # Anders: per item opnieuw om te zien welke items het probleem zijn
+            }
+        }
+        foreach ($it in $chunk) {
+            if ($script:StopRequested) { break }
+            try {
+                [void](Invoke-SP "$base('$($it.Id)')/restore()" -Method POST -Quiet)
+                $ok++
+            }
+            catch {
+                if (Test-AccessDenied $_) { throw }
+                $msg = $_.Exception.Message
+                # Al teruggezet door een eerdere (deels gelukte) batch of via de bovenliggende map
+                if ($msg -match '\[404\]|does not exist|bestaat niet|niet gevonden|not found') {
+                    $chk = $null
+                    try { $chk = Invoke-SP "$base('$($it.Id)')?`$select=Id" -Quiet } catch { }
+                    if (-not $chk) { $ok++; continue }
+                }
+                [void]$failed.Add(@{ Item = $it; Error = $msg })
+            }
+        }
+    }
+    return @{ Ok = $ok; Failed = $failed.ToArray() }
+}
+
+function Invoke-BulkRestore {
+    param([string]$Kind)
+    $items = @(Get-Targets $Kind 'Prullenbak terugzetten')
+    if (-not $items.Count) { return }
+    if ($items.Count -gt 25 -and (Show-Msg "De prullenbak van $($items.Count) item(s) ophalen kan even duren. Doorgaan?" 'Prullenbak terugzetten' 'YesNo' 'Question') -ne 'Yes') { return }
+    # 1. Inhoud van de prullenbakken ophalen
+    Start-LongOp 'Prullenbak ophalen...'
+    $rows = New-Object System.Collections.ArrayList
+    $n = 0
+    try {
+        foreach ($s in $items) {
+            if ($script:StopRequested) { Write-Log 'Gestopt door gebruiker' 'warning'; break }
+            $n++
+            Set-Status "Prullenbak ophalen $n van $($items.Count): $($s.Title)"
+            try {
+                $key = $(if ($Kind -eq 'O') { $script:OneDrives.IndexOf($s) } else { $script:Sites.IndexOf($s) })
+                $raw = @(Invoke-OnSite $s { Get-RecycleItemsCore $s })
+                foreach ($r in $raw) { [void]$rows.Add((ConvertFrom-RecycleItem $r $s $key)) }
+                Write-Log "$($s.Title): $($raw.Count) item(s) in de prullenbak" 'info'
+            }
+            catch { Write-Log "$($s.Title) (prullenbak): $($_.Exception.Message)" 'error' }
+        }
+    }
+    finally { Stop-LongOp }
+    if (-not $rows.Count) { Set-Status 'Geen items in de prullenbak gevonden'; Show-Msg 'Er staan geen (leesbare) items in de prullenbak van de gekozen site(s).' 'Prullenbak terugzetten' | Out-Null; return }
+    Set-Status "$($rows.Count) item(s) in de prullenbak gevonden"
+    # 2. Kiezen wat terug moet
+    $chosen = @(Show-RestoreDialog -Rows $rows.ToArray() -SiteCount $n)
+    if (-not $chosen.Count) { return }
+    # 3. Terugzetten per site
+    Start-LongOp 'Terugzetten...'
+    $ok = 0; $fail = 0
+    $list = if ($Kind -eq 'O') { $script:OneDrives } else { $script:Sites }
+    try {
+        foreach ($grp in @($chosen | Group-Object { $_.SiteKey })) {
+            if ($script:StopRequested) { Write-Log 'Gestopt door gebruiker' 'warning'; break }
+            $s = $list[[int]$grp.Name]
+            try {
+                $res = Invoke-OnSite $s { Restore-RecycleItemsCore $s @($grp.Group) }
+                $ok += $res.Ok; $fail += $res.Failed.Count
+                foreach ($f in $res.Failed) {
+                    Write-Log "$($s.Title): '$($f.Item.Dir)/$($f.Item.Name)' niet teruggezet: $($f.Error)" 'error'
+                    Write-ChangeLog $s.Url 'Prullenbak terugzetten' "$($f.Item.Dir)/$($f.Item.Name)" "FOUT: $($f.Error)"
+                }
+                $txt = "$($res.Ok) van $($grp.Count) item(s) teruggezet"
+                Write-Log "$($s.Title): $txt" $(if ($res.Failed.Count) { 'warning' } else { 'success' })
+                Write-ChangeLog $s.Url 'Prullenbak terugzetten' '' $txt
+                $s.RecycleMB = $null
+            }
+            catch {
+                $fail += $grp.Count
+                Write-Log "$($s.Title): $($_.Exception.Message)" 'error'
+                Write-ChangeLog $s.Url 'Prullenbak terugzetten' '' "FOUT: $($_.Exception.Message)"
+            }
+        }
+    }
+    finally { Stop-LongOp }
+    Update-KindGrid $Kind
+    $msg = "Prullenbak terugzetten: $ok teruggezet, $fail mislukt"
+    Set-Status $msg $(if ($fail) { 'error' } else { 'success' })
+    if ($fail) { Show-Msg "$msg.`n`nVeelvoorkomende oorzaak: er staat op de oorspronkelijke plek al een bestand met dezelfde naam. Zie de log voor details." 'Prullenbak terugzetten' 'OK' 'Warning' | Out-Null }
+}
+
 function Invoke-OdEmpty {
     $items = @(Get-SelectedOds)
     if (-not $items.Count) { Show-Msg 'Selecteer eerst de OneDrive(s) die je wilt leegmaken.' 'OneDrive leegmaken' | Out-Null; return }
@@ -2640,6 +2813,151 @@ function Show-EmptyDialog {
     $c.BtnOk.Add_Click({ $w.DialogResult = $true })
     if (-not $w.ShowDialog()) { return $null }
     return @{ EmptyBins = [bool]$c.ChkBins.IsChecked }
+}
+
+function Show-RestoreDialog {
+    # Toont de prullenbak-items met filters; geeft de gekozen items terug. Handlers vuren tijdens ShowDialog().
+    param($Rows, [int]$SiteCount)
+    $d = New-Dialog @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Prullenbak terugzetten" Width="1280" Height="760" MinWidth="900" MinHeight="500" WindowStartupLocation="CenterOwner" FontFamily="Segoe UI" FontSize="12" Background="#F5F5F5">
+  <Window.Resources>{{STYLES}}</Window.Resources>
+  <Grid Margin="14">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <TextBlock Grid.Row="0" x:Name="LblIntro" Style="{StaticResource Hint}" Foreground="#333333"/>
+    <WrapPanel Grid.Row="1">
+      <TextBlock Text="Zoeken:" Style="{StaticResource FieldLabel}" VerticalAlignment="Center" Margin="0,0,6,6"/>
+      <TextBox x:Name="TxtFind" Width="200" Style="{StaticResource FieldBox}" Margin="0,0,12,6" ToolTip="Zoekt in naam, locatie en site"/>
+      <TextBlock Text="Verwijderd door:" Style="{StaticResource FieldLabel}" VerticalAlignment="Center" Margin="0,0,6,6"/>
+      <ComboBox x:Name="CmbBy" Width="200" Height="26" Margin="0,0,12,6"/>
+      <TextBlock Text="Verwijderd van:" Style="{StaticResource FieldLabel}" VerticalAlignment="Center" Margin="0,0,6,6"/>
+      <DatePicker x:Name="DpFrom" Width="120" Height="26" Margin="0,0,6,6"/>
+      <TextBlock Text="t/m:" Style="{StaticResource FieldLabel}" VerticalAlignment="Center" Margin="0,0,6,6"/>
+      <DatePicker x:Name="DpTo" Width="120" Height="26" Margin="0,0,12,6"/>
+    </WrapPanel>
+    <WrapPanel Grid.Row="2">
+      <TextBlock Text="Type:" Style="{StaticResource FieldLabel}" VerticalAlignment="Center" Margin="0,0,6,6"/>
+      <ComboBox x:Name="CmbType" Width="160" Height="26" Margin="0,0,12,6"/>
+      <TextBlock Text="Fase:" Style="{StaticResource FieldLabel}" VerticalAlignment="Center" Margin="0,0,6,6"/>
+      <ComboBox x:Name="CmbStage" Width="130" Height="26" Margin="0,0,12,6"/>
+      <TextBlock Text="Site:" Style="{StaticResource FieldLabel}" VerticalAlignment="Center" Margin="0,0,6,6"/>
+      <ComboBox x:Name="CmbSite" Width="220" Height="26" Margin="0,0,12,6"/>
+      <Button x:Name="BtnToday" Content="Vandaag" Style="{StaticResource BtnGray}" Margin="0,0,6,6"/>
+      <Button x:Name="BtnWeek" Content="Laatste 7 dagen" Style="{StaticResource BtnGray}" Margin="0,0,6,6"/>
+      <Button x:Name="BtnReset" Content="Filters wissen" Style="{StaticResource BtnGray}" Margin="0,0,6,6"/>
+    </WrapPanel>
+    <DataGrid Grid.Row="3" x:Name="Grid" SelectionMode="Extended" Margin="0,4,0,8">
+      <DataGrid.Columns>
+        <DataGridTextColumn Header="Naam" Binding="{Binding Naam}" Width="230" ElementStyle="{StaticResource CellText}"/>
+        <DataGridTextColumn Header="Oorspronkelijke locatie" Binding="{Binding Locatie}" Width="300" ElementStyle="{StaticResource CellText}"/>
+        <DataGridTextColumn Header="Type" Binding="{Binding Type}" Width="100" ElementStyle="{StaticResource CellText}"/>
+        <DataGridTextColumn Header="Verwijderd op" Binding="{Binding Verwijderd, StringFormat=yyyy-MM-dd HH:mm}" Width="115" ElementStyle="{StaticResource CellText}"/>
+        <DataGridTextColumn Header="Verwijderd door" Binding="{Binding Door}" Width="160" ElementStyle="{StaticResource CellText}"/>
+        <DataGridTextColumn Header="Grootte (MB)" Binding="{Binding GrootteMB}" Width="85" ElementStyle="{StaticResource CellNum}"/>
+        <DataGridTextColumn Header="Fase" Binding="{Binding Fase}" Width="60" ElementStyle="{StaticResource CellText}"/>
+        <DataGridTextColumn Header="Gemaakt door" Binding="{Binding Auteur}" Width="140" ElementStyle="{StaticResource CellText}"/>
+        <DataGridTextColumn Header="Site" Binding="{Binding Site}" Width="180" ElementStyle="{StaticResource CellText}"/>
+      </DataGrid.Columns>
+    </DataGrid>
+    <TextBlock Grid.Row="4" x:Name="LblCount" FontWeight="SemiBold" Margin="0,0,0,6"/>
+    <DockPanel Grid.Row="5">
+      <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+        <Button x:Name="BtnSel" Content="Geselecteerde terugzetten" Style="{StaticResource BtnGreen}"/>
+        <Button x:Name="BtnAll" Content="Alles in filter terugzetten" Style="{StaticResource BtnOrange}"/>
+        <Button Content="Sluiten" Style="{StaticResource BtnGray}" IsCancel="True" Margin="0,0,0,6"/>
+      </StackPanel>
+      <StackPanel Orientation="Horizontal">
+        <Button x:Name="BtnSelAll" Content="Alles selecteren" Style="{StaticResource BtnGray}"/>
+        <Button x:Name="BtnCsv" Content="Export CSV" Style="{StaticResource BtnGray}"/>
+      </StackPanel>
+    </DockPanel>
+  </Grid>
+</Window>
+'@
+    $w = $d.W; $c = $d.C
+    $all = @($Rows)
+    $t = New-Object System.Data.DataTable
+    foreach ($col in @(@('Idx', [int]), @('Naam', [string]), @('Locatie', [string]), @('Type', [string]), @('Verwijderd', [datetime]),
+                       @('Door', [string]), @('GrootteMB', [double]), @('Fase', [string]), @('Auteur', [string]), @('Site', [string]))) {
+        [void]$t.Columns.Add($col[0], $col[1])
+    }
+    for ($i = 0; $i -lt $all.Count; $i++) {
+        $r = $all[$i]
+        $dr = $t.NewRow()
+        $dr['Idx'] = $i; $dr['Naam'] = $r.Name; $dr['Locatie'] = $r.Dir; $dr['Type'] = $r.Type
+        if ($r.Deleted -gt [datetime]::MinValue) { $dr['Verwijderd'] = $r.Deleted } else { $dr['Verwijderd'] = [DBNull]::Value }
+        $dr['Door'] = $r.By; $dr['GrootteMB'] = $r.SizeMB; $dr['Fase'] = $r.Stage; $dr['Auteur'] = $r.Author; $dr['Site'] = $r.Site
+        [void]$t.Rows.Add($dr)
+    }
+    $view = $t.DefaultView
+    $view.Sort = 'Verwijderd DESC'
+    $c.Grid.ItemsSource = $view
+    $c.LblIntro.Text = "$($all.Count) item(s) in de prullenbak van $SiteCount site(s). Filter en selecteer wat terug moet. Items gaan terug naar hun oorspronkelijke locatie; verwijderde mappen worden eerst teruggezet. Staat er al een bestand met dezelfde naam, dan mislukt dat item."
+    $c.CmbBy.ItemsSource = @('(iedereen)') + @($all | ForEach-Object { $_.By } | Where-Object { $_ } | Sort-Object -Unique)
+    $c.CmbType.ItemsSource = @('(alle typen)') + @($all | ForEach-Object { $_.Type } | Sort-Object -Unique)
+    $c.CmbStage.ItemsSource = @('(beide)', '1e fase', '2e fase')
+    $c.CmbSite.ItemsSource = @('(alle sites)') + @($all | ForEach-Object { $_.Site } | Sort-Object -Unique)
+    foreach ($cb in @($c.CmbBy, $c.CmbType, $c.CmbStage, $c.CmbSite)) { $cb.SelectedIndex = 0 }
+    if (@($c.CmbSite.ItemsSource).Count -le 2) { $c.CmbSite.IsEnabled = $false }
+
+    $st = @{ Result = @(); Busy = $false }
+    $q = { param([string]$v) return $v.Replace("'", "''") }
+    $inv = [cultureinfo]::InvariantCulture
+    $size = { param([double]$MB) if ($MB -ge 1024) { "$([Math]::Round($MB / 1024, 2)) GB" } else { "$([Math]::Round($MB, 1)) MB" } }
+    $count = {
+        $n = 0; $mb = 0.0
+        foreach ($rv in $view) { $n++; if ($rv.Row['GrootteMB'] -isnot [DBNull]) { $mb += [double]$rv.Row['GrootteMB'] } }
+        $sel = $c.Grid.SelectedItems.Count
+        $c.LblCount.Text = "$n van $($all.Count) item(s) in filter ($(& $size $mb))$(if ($sel) { "  |  $sel geselecteerd" })"
+    }
+    $apply = {
+        if ($st.Busy) { return }
+        $parts = @()
+        $txt = $c.TxtFind.Text.Trim()
+        if ($txt) { $l = ConvertTo-LikeLiteral $txt; $parts += "(Naam LIKE '%$l%' OR Locatie LIKE '%$l%' OR Site LIKE '%$l%')" }
+        if ($c.CmbBy.SelectedIndex -gt 0) { $parts += "Door = '$(& $q ([string]$c.CmbBy.SelectedItem))'" }
+        if ($c.CmbType.SelectedIndex -gt 0) { $parts += "Type = '$(& $q ([string]$c.CmbType.SelectedItem))'" }
+        if ($c.CmbStage.SelectedIndex -gt 0) { $parts += "Fase = '$(& $q ([string]$c.CmbStage.SelectedItem))'" }
+        if ($c.CmbSite.SelectedIndex -gt 0) { $parts += "Site = '$(& $q ([string]$c.CmbSite.SelectedItem))'" }
+        if ($c.DpFrom.SelectedDate) { $parts += "Verwijderd >= #$(([datetime]$c.DpFrom.SelectedDate).Date.ToString('MM/dd/yyyy', $inv))#" }
+        if ($c.DpTo.SelectedDate) { $parts += "Verwijderd < #$(([datetime]$c.DpTo.SelectedDate).Date.AddDays(1).ToString('MM/dd/yyyy', $inv))#" }
+        $view.RowFilter = $parts -join ' AND '
+        & $count
+    }
+    $c.TxtFind.Add_TextChanged($apply)
+    foreach ($cb in @($c.CmbBy, $c.CmbType, $c.CmbStage, $c.CmbSite)) { $cb.Add_SelectionChanged($apply) }
+    $c.DpFrom.Add_SelectedDateChanged($apply)
+    $c.DpTo.Add_SelectedDateChanged($apply)
+    $c.Grid.Add_SelectionChanged($count)
+    $c.BtnToday.Add_Click({ $st.Busy = $true; $c.DpFrom.SelectedDate = (Get-Date).Date; $c.DpTo.SelectedDate = (Get-Date).Date; $st.Busy = $false; & $apply })
+    $c.BtnWeek.Add_Click({ $st.Busy = $true; $c.DpFrom.SelectedDate = (Get-Date).Date.AddDays(-6); $c.DpTo.SelectedDate = (Get-Date).Date; $st.Busy = $false; & $apply })
+    $c.BtnReset.Add_Click({
+        $st.Busy = $true
+        $c.TxtFind.Text = ''; $c.DpFrom.SelectedDate = $null; $c.DpTo.SelectedDate = $null
+        foreach ($cb in @($c.CmbBy, $c.CmbType, $c.CmbStage, $c.CmbSite)) { $cb.SelectedIndex = 0 }
+        $st.Busy = $false
+        & $apply
+    })
+    $c.BtnSelAll.Add_Click({ $c.Grid.SelectAll(); [void]$c.Grid.Focus() })
+    $c.BtnCsv.Add_Click({ Export-GridCsv $c.Grid 'Prullenbak' })
+    $finish = {
+        param([object[]]$Picked, [string]$What)
+        if (-not $Picked.Count) { Show-Msg 'Er zijn geen items om terug te zetten.' 'Terugzetten' -Owner $w | Out-Null; return }
+        $mb = 0.0; foreach ($p in $Picked) { $mb += [double]$p.SizeMB }
+        $sites = @($Picked | ForEach-Object { $_.SiteKey } | Sort-Object -Unique).Count
+        if ((Show-Msg "$What`: $($Picked.Count) item(s) ($(& $size $mb)) op $sites site(s) terugzetten naar de oorspronkelijke locatie?" 'Terugzetten' 'YesNo' 'Question' -Owner $w) -ne 'Yes') { return }
+        $st.Result = $Picked
+        $w.DialogResult = $true
+    }
+    $c.BtnSel.Add_Click({
+        $picked = @($c.Grid.SelectedItems | ForEach-Object { $all[[int]$_.Row['Idx']] })
+        if (-not $picked.Count) { Show-Msg 'Selecteer eerst items (Ctrl/Shift-klik of Alles selecteren), of gebruik Alles in filter terugzetten.' 'Terugzetten' -Owner $w | Out-Null; return }
+        & $finish $picked 'Geselecteerde items'
+    })
+    $c.BtnAll.Add_Click({ & $finish @(foreach ($rv in $view) { $all[[int]$rv.Row['Idx']] }) 'Alles in het filter' })
+    & $count
+    if (-not $w.ShowDialog()) { return @() }
+    return $st.Result
 }
 
 function Show-PrincipalPicker {
@@ -3253,6 +3571,7 @@ $script:MainXamlTemplate = @'
               <Button x:Name="BtnSiteQuota" Content="Quotum..." Style="{StaticResource Tool}"/>
               <Button x:Name="BtnSiteLock" Content="Vergrendeling..." Style="{StaticResource ToolGray}"/>
               <Button x:Name="BtnSiteVersions" Content="Versies opschonen..." Style="{StaticResource ToolOrange}"/>
+              <Button x:Name="BtnSiteRestore" Content="Prullenbak terugzetten..." Style="{StaticResource ToolGreen}" ToolTip="Items uit de prullenbak (1e en 2e fase) van de geselecteerde sites bekijken, filteren (wie, wanneer, type) en in bulk terugzetten"/>
               <Button x:Name="BtnSiteRecycle" Content="Prullenbak legen" Style="{StaticResource ToolRed}"/>
               <Border Style="{StaticResource Sep}"/>
               <CheckBox x:Name="ChkAutoElevate" Content="Mezelf automatisch sitebeheerder maken bij geen toegang" Margin="0,0,10,6"
@@ -3319,6 +3638,7 @@ $script:MainXamlTemplate = @'
               <Button x:Name="BtnOdQuota" Content="Quotum..." Style="{StaticResource Tool}"/>
               <Button x:Name="BtnOdLock" Content="Vergrendeling..." Style="{StaticResource ToolGray}"/>
               <Button x:Name="BtnOdVersions" Content="Versies opschonen..." Style="{StaticResource ToolOrange}"/>
+              <Button x:Name="BtnOdRestore" Content="Prullenbak terugzetten..." Style="{StaticResource ToolGreen}" ToolTip="Items uit de prullenbak (1e en 2e fase) van de geselecteerde OneDrives bekijken, filteren (wie, wanneer, type) en in bulk terugzetten"/>
               <Button x:Name="BtnOdRecycle" Content="Prullenbak legen" Style="{StaticResource ToolRed}"/>
               <Button x:Name="BtnOdEmpty" Content="OneDrive leegmaken..." Style="{StaticResource ToolRed}"/>
               <Border Style="{StaticResource Sep}"/>
@@ -3455,7 +3775,8 @@ function Invoke-Connect {
         foreach ($b in @($script:ChkAutoElevate, $script:ChkOdAutoElevate, $script:BtnBulkSharing, $script:BtnSiteQuota, $script:BtnSiteLock,
                          $script:BtnOdAdminAdd, $script:BtnOdAdminRemove, $script:BtnOdSharing, $script:BtnOdQuota, $script:BtnOdLock)) { $b.IsEnabled = $script:HasAdmin }
         foreach ($b in @($script:BtnBulkAdd, $script:BtnBulkRemove, $script:BtnBulkReport, $script:BtnBulkGroups, $script:BtnGrpScan, $script:BtnAccScan,
-                         $script:BtnSiteScan, $script:BtnSiteVersions, $script:BtnSiteRecycle, $script:BtnOdScan, $script:BtnOdVersions, $script:BtnOdRecycle, $script:BtnOdEmpty)) { $b.IsEnabled = $script:SpOk }
+                         $script:BtnSiteScan, $script:BtnSiteVersions, $script:BtnSiteRecycle, $script:BtnOdScan, $script:BtnOdVersions, $script:BtnOdRecycle, $script:BtnOdEmpty,
+                         $script:BtnSiteRestore, $script:BtnOdRestore)) { $b.IsEnabled = $script:SpOk }
         Set-Status "Verbonden als $($script:MeUpn)" 'success'
         Exit-Busy
         $script:OdLoaded = $false
@@ -3559,6 +3880,7 @@ function New-MainWindow {
     $script:BtnSiteLock.Add_Click({ Invoke-BulkLock 'S' })
     $script:BtnSiteVersions.Add_Click({ Invoke-BulkVersions 'S' })
     $script:BtnSiteRecycle.Add_Click({ Invoke-BulkRecycle 'S' })
+    $script:BtnSiteRestore.Add_Click({ Invoke-BulkRestore 'S' })
     $script:BtnElevRevoke.Add_Click({ Invoke-ElevateRevoke })
 
     # --- OneDrive ---
@@ -3577,6 +3899,7 @@ function New-MainWindow {
     $script:BtnOdLock.Add_Click({ Invoke-BulkLock 'O' })
     $script:BtnOdVersions.Add_Click({ Invoke-BulkVersions 'O' })
     $script:BtnOdRecycle.Add_Click({ Invoke-BulkRecycle 'O' })
+    $script:BtnOdRestore.Add_Click({ Invoke-BulkRestore 'O' })
     $script:BtnOdEmpty.Add_Click({ Invoke-OdEmpty })
     $script:BtnOdElevRevoke.Add_Click({ Invoke-ElevateRevoke })
     $script:MainArea.Add_SelectionChanged({
