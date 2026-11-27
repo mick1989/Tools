@@ -19,6 +19,13 @@
                                              overname verbreken/herstellen, toegang
                                              geven/intrekken, versielimiet, versies
                                              opschonen.
+                           Delen             wie mag delen per site/bibliotheek
+                                             (volledig, bestanden/mappen, alleen
+                                             aanvragen, bestaande toegang) en met
+                                             wie (intern/gasten/anoniem, domein- en
+                                             groepsbeperking); alle tenant- en
+                                             site-deelinstellingen; bestaande
+                                             deellinks per bestand/map.
                          Bulk: toegang geven/intrekken, extern delen, quotum,
                          vergrendeling, versies opschonen, prullenbak terugzetten
                          (filter op wie/wanneer/type) of legen, machtigingenrapport,
@@ -861,7 +868,7 @@ function New-SiteObject {
         Url = ''; Title = ''; Template = ''; GroupId = ''; Teams = $false; Type = 'Onbekend'; IsOneDrive = $false
         UsedMB = $null; QuotaMB = $null; Files = $null; ActiveFiles = $null; PageViews = $null
         LastActivity = ''; Created = ''; Owner = ''; OwnerUpn = ''; Status = ''
-        Sharing = ''; Lock = ''; Libraries = $null; Unique = $null; VersionsMB = $null; RecycleMB = $null
+        Sharing = ''; MemberShare = ''; Lock = ''; Libraries = $null; Unique = $null; VersionsMB = $null; RecycleMB = $null
         Meta = $null; Lists = $null; LibInfo = $null
     }
     foreach ($k in $Values.Keys) { $o[$k] = $Values[$k] }
@@ -1061,7 +1068,7 @@ function Get-SizeCols {
 }
 
 $script:SiteCols = @('Key:int', 'Titel', 'Url', 'Type', 'Groep', 'GebruiktGB:double', 'QuotumGB:double', 'Pct:double', 'Bestanden:double', 'Actief:double',
-                     'Weergaven:double', 'Activiteit', 'Eigenaar', 'Delen', 'Lock', 'Bibliotheken:int', 'Uniek:int', 'VersiesGB:double', 'PrullenbakGB:double',
+                     'Weergaven:double', 'Activiteit', 'Eigenaar', 'Delen', 'LedenDelen', 'Lock', 'Bibliotheken:int', 'Uniek:int', 'VersiesGB:double', 'PrullenbakGB:double',
                      'TeWinnenGB:double', 'Aangemaakt')
 
 function Update-SiteGrid {
@@ -1070,7 +1077,7 @@ function Update-SiteGrid {
         $h = Get-SizeCols $s
         $h.Key = $i; $h.Titel = $s.Title; $h.Url = $s.Url; $h.Type = $s.Type; $h.Groep = $(if ($s.GroupId) { 'Ja' } else { '' })
         $h.Bestanden = $s.Files; $h.Actief = $s.ActiveFiles; $h.Weergaven = $s.PageViews; $h.Activiteit = $s.LastActivity
-        $h.Eigenaar = $s.Owner; $h.Delen = $s.Sharing; $h.Lock = $s.Lock; $h.Bibliotheken = $s.Libraries; $h.Uniek = $s.Unique
+        $h.Eigenaar = $s.Owner; $h.Delen = $s.Sharing; $h.LedenDelen = $s.MemberShare; $h.Lock = $s.Lock; $h.Bibliotheken = $s.Libraries; $h.Uniek = $s.Unique
         $h.Aangemaakt = $s.Created
         $h
     }
@@ -1206,7 +1213,7 @@ function Get-PrincipalInfo {
 }
 
 function New-PermRow {
-    param($Site, [string]$Scope, [string]$ListId, [string]$Source, [string]$Roles, $User, [string]$Mode, $SpGroupId, $SpGroupTitle)
+    param($Site, [string]$Scope, [string]$ListId, [string]$Source, [string]$Roles, $User, [string]$Mode, $SpGroupId, $SpGroupTitle, [uint64]$PermLow = 0)
     $login = [string]$User.LoginName
     if ([string]$User.Title -eq 'System Account') { return $null }
     $info = Get-PrincipalInfo $login
@@ -1215,8 +1222,17 @@ function New-PermRow {
         SiteUrl = $Site.Url; SiteTitle = $Site.Title; Scope = $Scope; ListId = $ListId
         Source = $Source; Roles = $Roles; Name = [string]$User.Title
         Kind = $info.Kind; ObjectId = $info.ObjectId; Upn = $info.Upn; Login = $login; Email = [string]$User.Email
-        Mode = $Mode; SpGroupId = $SpGroupId; SpGroupTitle = $SpGroupTitle; SpUserId = $User.Id
+        Mode = $Mode; SpGroupId = $SpGroupId; SpGroupTitle = $SpGroupTitle; SpUserId = $User.Id; PermLow = $PermLow
     }
+}
+
+function ConvertTo-PermLow {
+    # Onderste 32 bits van SP.BasePermissions (ManagePermissions, EditListItems, ViewListItems zitten hierin)
+    param($Bp)
+    if (-not $Bp) { return [uint64]0 }
+    $v = [uint64]0
+    if ([uint64]::TryParse([string]$Bp.Low, [ref]$v)) { return $v }
+    return [uint64]0
 }
 
 function Get-Coll {
@@ -1261,9 +1277,12 @@ function Add-RoleRows {
     foreach ($a in @($Assignments)) {
         $m = $a.Member
         if (-not $m) { continue }
-        $roles = @(Get-Coll $a.RoleDefinitionBindings | Where-Object { -not $_.Hidden -and $_.Name -notmatch '^(Limited Access|Beperkte toegang)' } | ForEach-Object { $_.Name })
+        $bind = @(Get-Coll $a.RoleDefinitionBindings | Where-Object { -not $_.Hidden -and $_.Name -notmatch '^(Limited Access|Beperkte toegang)' })
+        $roles = @($bind | ForEach-Object { $_.Name })
         if (-not $roles.Count) { continue }
         $rolesTxt = $roles -join ', '
+        $low = [uint64]0
+        foreach ($b in $bind) { $low = $low -bor (ConvertTo-PermLow $b.BasePermissions) }
         if ([int]$m.PrincipalType -eq 8) {
             $tag = if ($m.Id -eq $Meta.Owner) { ' [eigenaars]' } elseif ($m.Id -eq $Meta.Member) { ' [leden]' } elseif ($m.Id -eq $Meta.Visitor) { ' [bezoekers]' } else { '' }
             $src = if ([string]$m.Title -match '^SharingLinks\.') { 'Deellink' } else { "SP-groep: $($m.Title)$tag" }
@@ -1276,12 +1295,12 @@ function Add-RoleRows {
                                    SpGroupId = $m.Id; SpGroupTitle = [string]$m.Title; SpUserId = $null; Empty = $true })
             }
             foreach ($u in $users) {
-                $r = New-PermRow -Site $Site -Scope $Scope -ListId $ListId -Source $src -Roles $rolesTxt -User $u -Mode 'group' -SpGroupId $m.Id -SpGroupTitle ([string]$m.Title)
+                $r = New-PermRow -Site $Site -Scope $Scope -ListId $ListId -Source $src -Roles $rolesTxt -User $u -Mode 'group' -SpGroupId $m.Id -SpGroupTitle ([string]$m.Title) -PermLow $low
                 if ($r) { [void]$Rows.Add($r) }
             }
         }
         else {
-            $r = New-PermRow -Site $Site -Scope $Scope -ListId $ListId -Source 'Directe rechten' -Roles $rolesTxt -User $m -Mode 'direct'
+            $r = New-PermRow -Site $Site -Scope $Scope -ListId $ListId -Source 'Directe rechten' -Roles $rolesTxt -User $m -Mode 'direct' -PermLow $low
             if ($r) { [void]$Rows.Add($r) }
         }
     }
@@ -1299,7 +1318,7 @@ function Get-SitePermissionsCore {
     Add-RoleRows $rows $Site $ra $byId $meta 'Site' ''
     $admins = @((Invoke-SP "$base/_api/web/siteusers?`$filter=IsSiteAdmin eq true" -Quiet).value)
     foreach ($u in $admins) {
-        $r = New-PermRow -Site $Site -Scope 'Site' -ListId '' -Source 'Sitebeheerder' -Roles 'Sitecollectiebeheerder' -User $u -Mode 'admin'
+        $r = New-PermRow -Site $Site -Scope 'Site' -ListId '' -Source 'Sitebeheerder' -Roles 'Sitecollectiebeheerder' -User $u -Mode 'admin' -PermLow ([uint64]4294967295)
         if ($r) { [void]$rows.Add($r) }
     }
     # Bibliotheken en lijsten met eigen (unieke) rechten
@@ -1338,7 +1357,7 @@ function Get-LibraryInfoCore {
                 $size = ConvertTo-Num $m.TotalSize; $files = ConvertTo-Num $m.TotalFileStreamSize
             } catch { }
         }
-        $ver = if ($null -ne $size -and $null -ne $files) { [Math]::Max(0, $size - $files) } else { $null }
+        $ver = if ($null -ne $size -and $null -ne $files) { [Math]::Max([double]0, [double]($size - $files)) } else { $null }
         [void]$out.Add(@{
             Id = [string]$l.Id; Title = [string]$l.Title; IsLib = $isLib; Kind = $(if ($isLib) { 'Bibliotheek' } else { 'Lijst' })
             Template = [int]$l.BaseTemplate; Items = [int]$l.ItemCount; Unique = [bool]$l.HasUniqueRoleAssignments
@@ -1456,12 +1475,17 @@ function Show-SiteDetail {
         $Site.VersionsMB = $v
         Update-PermGrid $P
         Update-LibGrid $P
+        $x.Links = @(); $x.LinksLoaded = $false
+        Update-ShareLinkGrid $P
+        try { Update-ShareInfo $P }
+        catch { $x.ShareInfo = $null; Update-ShareWhoGrid $P; Write-Log "Deelinstellingen $($Site.Url): $($_.Exception.Message)" 'warning' }
         $nU = @($x.PermRows | Where-Object { $_.Scope -ne 'Site' } | ForEach-Object { $_.Scope } | Select-Object -Unique).Count
         Set-Status "$($Site.Title): $($x.PermRows.Count) machtigingen, $($x.Libs.Count) lijsten/bibliotheken ($nU met eigen rechten)" 'success'
     }
     catch {
-        $x.PermRows = @(); $x.Libs = @()
-        Update-PermGrid $P; Update-LibGrid $P
+        $x.PermRows = @(); $x.Libs = @(); $x.ShareInfo = $null; $x.Links = @(); $x.LinksLoaded = $false
+        Update-PermGrid $P; Update-LibGrid $P; Update-ShareWhoGrid $P; Update-ShareLinkGrid $P
+        $x.ShareSetGrid.ItemsSource = $null
         $msg = $_.Exception.Message
         if (Test-AccessDenied $_) { $msg += '  (zet "Mezelf automatisch sitebeheerder maken" aan om toch te kijken)' }
         $x.LblGroup.Text = "Niet geladen: $msg"
@@ -1475,6 +1499,656 @@ function Invoke-DetailReload {
     param([string]$P)
     $x = $script:Ctx[$P]
     if ($x.Site) { $x.Site.Meta = $null; Show-SiteDetail $P $x.Site }
+}
+
+#endregion
+
+#region --- Delen: wie mag wat delen (tenant, site, bibliotheek, deellinks) ---
+
+$script:TenantShare     = $null   # cache: tenant-eigenschappen (dictionary)
+$script:ShareGroupCheck = @{}     # upn -> $true/$false/$null (lid van groep die extern mag delen)
+$script:PermManage = [uint64]0x2000000   # ManagePermissions
+$script:PermEdit   = [uint64]0x4         # EditListItems
+$script:PermView   = [uint64]0x1         # ViewListItems
+# SharingCapability van streng naar ruim
+$script:ShareRank = @{ 0 = 0; 3 = 1; 1 = 2; 2 = 3 }
+$script:ShareWithLabels = @{ 0 = 'Alleen intern'; 1 = 'Intern + bestaande gasten'; 2 = 'Intern + gasten (ook nieuwe)'; 3 = 'Intern + gasten + iedereen (anonieme link)' }
+$script:LinkTypeLabels     = @{ 0 = 'Volgt tenant'; 1 = 'Specifieke personen'; 2 = 'Personen in de organisatie'; 3 = 'Iedereen met de link' }
+$script:LinkPermLabels     = @{ 0 = 'Volgt tenant'; 1 = 'Bekijken'; 2 = 'Bewerken' }
+$script:DomainModeLabels   = @{ 0 = 'Geen beperking'; 1 = 'Alleen toegestane domeinen'; 2 = 'Geblokkeerde domeinen' }
+$script:AnonLinkLabels     = @{ 0 = 'Geen'; 1 = 'Bekijken'; 2 = 'Bewerken' }
+$script:CaPolicyLabels     = @{ 0 = 'Volledige toegang'; 1 = 'Beperkt (alleen web)'; 2 = 'Geblokkeerd'; 3 = 'Verificatiecontext' }
+$script:SharingStateLabels = @{ 0 = 'Niet ingesteld (standaard)'; 1 = 'Aan'; 2 = 'Uit' }
+$script:CompanyLinkLabels  = @{ 0 = 'Onbekend'; 1 = 'Uitgeschakeld'; 2 = 'Toegestaan' }
+
+# Naam, label, enum-tabel (of $null), toelichting
+$script:TenantShareSpec = @(
+    @('SharingCapability', 'Extern delen SharePoint', 'SharingLabels', 'Bovengrens voor alle sites'),
+    @('OneDriveSharingCapability', 'Extern delen OneDrive', 'SharingLabels', 'Bovengrens voor alle OneDrives'),
+    @('DefaultSharingLinkType', 'Standaard linktype', 'LinkTypeLabels', 'Voorgeselecteerd in het deelvenster'),
+    @('DefaultLinkPermission', 'Standaard linkrechten', 'LinkPermLabels', ''),
+    @('RequireAnonymousLinksExpireInDays', 'Iedereen-links verlopen na (dagen)', $null, '-1 of 0 = verlopen niet'),
+    @('FileAnonymousLinkType', 'Iedereen-links op bestanden', 'AnonLinkLabels', 'Maximale rechten van een Iedereen-link'),
+    @('FolderAnonymousLinkType', 'Iedereen-links op mappen', 'AnonLinkLabels', 'Maximale rechten van een Iedereen-link'),
+    @('PreventExternalUsersFromResharing', 'Gasten mogen NIET doordelen', $null, 'Ja = gasten kunnen items die niet van hen zijn niet verder delen'),
+    @('RequireAcceptingAccountMatchInvitedAccount', 'Gast moet het uitgenodigde account gebruiken', $null, ''),
+    @('SharingDomainRestrictionMode', 'Domeinbeperking', 'DomainModeLabels', ''),
+    @('SharingAllowedDomainList', 'Toegestane domeinen', $null, ''),
+    @('SharingBlockedDomainList', 'Geblokkeerde domeinen', $null, ''),
+    @('GuestSharingGroupAllowListInTenantByPrincipalIdentity', 'Alleen deze groepen mogen extern delen', $null, 'Leeg = iedereen met deelrechten'),
+    @('GuestSharingGroupAllowListInTenant', 'Alleen deze groepen mogen extern delen (oud)', $null, ''),
+    @('ExternalUserExpirationRequired', 'Gasttoegang verloopt automatisch', $null, ''),
+    @('ExternalUserExpireInDays', 'Gasttoegang verloopt na (dagen)', $null, ''),
+    @('EmailAttestationRequired', 'Gasten moeten zich opnieuw verifieren', $null, ''),
+    @('EmailAttestationReAuthDays', 'Opnieuw verifieren na (dagen)', $null, ''),
+    @('ShowEveryoneClaim', "'Iedereen' zichtbaar in personenkiezer", $null, ''),
+    @('ShowEveryoneExceptExternalUsersClaim', "'Iedereen behalve externe gebruikers' zichtbaar", $null, 'Hiermee kan de hele organisatie in een keer toegang krijgen'),
+    @('ShowAllUsersClaim', "'Alle gebruikers' zichtbaar", $null, ''),
+    @('ODBMembersCanShare', 'OneDrive: anderen dan de eigenaar mogen delen', 'SharingStateLabels', ''),
+    @('ODBAccessRequests', 'OneDrive: toegangsaanvragen', 'SharingStateLabels', ''),
+    @('ConditionalAccessPolicy', 'Onbeheerde apparaten', 'CaPolicyLabels', '')
+)
+$script:SiteShareSpec = @(
+    @('SharingCapability', 'Extern delen (site)', 'SharingLabels', 'Kan niet ruimer dan de tenant'),
+    @('DefaultSharingLinkType', 'Standaard linktype', 'LinkTypeLabels', ''),
+    @('DefaultLinkPermission', 'Standaard linkrechten', 'LinkPermLabels', ''),
+    @('DefaultLinkToExistingAccess', "Standaard link 'Personen met bestaande toegang'", $null, ''),
+    @('DisableCompanyWideSharingLinks', 'Organisatie-links', 'CompanyLinkLabels', "Links 'Personen in de organisatie'"),
+    @('AnonymousLinkExpirationInDays', 'Iedereen-links verlopen na (dagen)', $null, ''),
+    @('OverrideTenantAnonymousLinkExpirationPolicy', 'Eigen verloopbeleid Iedereen-links', $null, ''),
+    @('ExternalUserExpirationInDays', 'Gasttoegang verloopt na (dagen)', $null, ''),
+    @('OverrideTenantExternalUserExpirationPolicy', 'Eigen verloopbeleid gasttoegang', $null, ''),
+    @('FileAnonymousLinkType', 'Iedereen-links op bestanden', 'AnonLinkLabels', ''),
+    @('FolderAnonymousLinkType', 'Iedereen-links op mappen', 'AnonLinkLabels', ''),
+    @('SharingDomainRestrictionMode', 'Domeinbeperking', 'DomainModeLabels', ''),
+    @('SharingAllowedDomainList', 'Toegestane domeinen', $null, ''),
+    @('SharingBlockedDomainList', 'Geblokkeerde domeinen', $null, ''),
+    @('ShowPeoplePickerSuggestionsForGuestUsers', 'Gasten voorstellen in personenkiezer', $null, ''),
+    @('DisableSharingForNonOwnersStatus', 'Delen door niet-eigenaars uit (status)', $null, 'Ruwe waarde; zie ook Leden mogen delen'),
+    @('ConditionalAccessPolicy', 'Onbeheerde apparaten', 'CaPolicyLabels', ''),
+    @('AllowEditing', 'Bewerken bij beperkte toegang', $null, ''),
+    @('BlockDownloadPolicy', 'Downloaden geblokkeerd', $null, ''),
+    @('RestrictedAccessControl', 'Beperkte toegangscontrole (RAC)', $null, 'Alleen leden van de RAC-groepen kunnen erbij, ook met een deellink'),
+    @('RestrictedAccessControlGroups', 'RAC-groepen', $null, ''),
+    @('SensitivityLabel', 'Gevoeligheidslabel', $null, 'Een label kan deelinstellingen afdwingen'),
+    @('BlockGuestsAsSiteAdmin', 'Gasten als sitebeheerder blokkeren', $null, ''),
+    @('LockState', 'Vergrendeling', $null, ''),
+    @('OverrideSharingCapability', 'Wijkt af van tenant-deelinstelling', $null, '')
+)
+$script:ShareRawPattern = 'Shar|Link|Anonym|Extern|Guest|Domain|Access|Download|Edit|Restrict|Label|Expir|Claim|Invit|Attestation|ODB|Conditional|Block|Lock|Owner'
+
+function ConvertFrom-JsonDict {
+    # JSON naar dictionaries (hoofdlettergevoelig: PS 5.1 ConvertFrom-Json faalt op dubbele sleutels)
+    param([string]$Text)
+    if ($PSVersionTable.PSVersion.Major -ge 6) { return ,(ConvertFrom-Json $Text -AsHashtable) }
+    Add-Type -AssemblyName System.Web.Extensions
+    $js = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $js.MaxJsonLength = [int]::MaxValue
+    return ,($js.DeserializeObject($Text))
+}
+
+function Invoke-CsomDict {
+    param([string]$Actions, [string]$ObjectPaths)
+    $xml = '<Request xmlns="http://schemas.microsoft.com/sharepoint/clientquery/2009" SchemaVersion="15.0.0.0" LibraryVersion="16.0.0.0" ApplicationName="SharePointBeheerTool">' +
+           "<Actions>$Actions</Actions><ObjectPaths>$ObjectPaths</ObjectPaths></Request>"
+    $h = @{ Authorization = "Bearer $(Get-SpToken $script:AdminUrl)"; Accept = 'application/json' }
+    $txt = Invoke-Api -Uri "$($script:AdminUrl)/_vti_bin/client.svc/ProcessQuery" -Method POST -Body $xml -Headers $h -ContentType 'text/xml; charset=utf-8' -Quiet -Raw
+    $arr = ConvertFrom-JsonDict ([string]$txt)
+    $arr = @($arr)
+    if ($arr.Count -and $arr[0] -is [System.Collections.IDictionary] -and $arr[0]['ErrorInfo']) { throw "CSOM: $($arr[0]['ErrorInfo']['ErrorMessage'])" }
+    return ,$arr
+}
+
+function Test-DKey {
+    param($D, [string]$Name)
+    if (-not ($D -is [System.Collections.IDictionary])) { return $false }
+    if ($D.PSObject.Methods['ContainsKey']) { return [bool]$D.ContainsKey($Name) }
+    return (@($D.Keys) -ccontains $Name)
+}
+
+function Get-D {
+    param($D, [string]$Name)
+    if (Test-DKey $D $Name) { return $D[$Name] }
+    return $null
+}
+
+function Get-TenantShareSettings {
+    param([switch]$Force)
+    if ($script:TenantShare -and -not $Force) { return $script:TenantShare }
+    if (-not $script:HasAdmin) { return $null }
+    $a = '<ObjectPath Id="2" ObjectPathId="1" /><Query Id="3" ObjectPathId="1"><Query SelectAllProperties="true"><Properties /></Query></Query>'
+    $o = "<Constructor Id=`"1`" TypeId=`"$($script:TenantTypeId)`" />"
+    $arr = Invoke-CsomDict $a $o
+    $script:TenantShare = $arr | Where-Object { $_ -is [System.Collections.IDictionary] -and [string]$_['_ObjectType_'] -match 'TenantAdministration\.Tenant$' } | Select-Object -First 1
+    return $script:TenantShare
+}
+
+function Get-SiteShareProps {
+    param([string]$SiteUrl)
+    $a = '<ObjectPath Id="2" ObjectPathId="1" /><ObjectPath Id="4" ObjectPathId="3" /><Query Id="5" ObjectPathId="3"><Query SelectAllProperties="true"><Properties /></Query></Query>'
+    $o = "<Constructor Id=`"1`" TypeId=`"$($script:TenantTypeId)`" />" +
+         "<Method Id=`"3`" ParentId=`"1`" Name=`"GetSitePropertiesByUrl`"><Parameters><Parameter Type=`"String`">$(ConvertTo-XmlText $SiteUrl)</Parameter><Parameter Type=`"Boolean`">true</Parameter></Parameters></Method>"
+    $arr = Invoke-CsomDict $a $o
+    return ($arr | Where-Object { $_ -is [System.Collections.IDictionary] -and [string]$_['_ObjectType_'] -match 'SiteProperties$' } | Select-Object -First 1)
+}
+
+function Get-WebShareSettingsCore {
+    # Site-instellingen 'Wijzigen hoe leden kunnen delen' en toegangsaanvragen
+    param($Site)
+    $base = $Site.Url
+    $r = @{ MembersCanShare = $null; RequestAccessEmail = ''; UseAccessRequestDefault = $null; AllowMembersEditMembership = $null
+            MemberGroup = ''; AllowRequestToJoinLeave = $null; AutoAcceptRequestToJoinLeave = $null; OnlyAllowMembersViewMembership = $null; AccessRequestsOn = $null }
+    try {
+        $w = Invoke-SP "$base/_api/web?`$select=MembersCanShare,RequestAccessEmail" -Quiet
+        $r.MembersCanShare = [bool]$w.MembersCanShare
+        $r.RequestAccessEmail = [string]$w.RequestAccessEmail
+    }
+    catch { Write-Log "$($Site.Title): MembersCanShare niet gelezen: $($_.Exception.Message)" 'warning' }
+    try { $w2 = Invoke-SP "$base/_api/web?`$select=UseAccessRequestDefault" -Quiet; $r.UseAccessRequestDefault = [bool]$w2.UseAccessRequestDefault } catch { }
+    try {
+        $g = Invoke-SP "$base/_api/web/AssociatedMemberGroup?`$select=Title,AllowMembersEditMembership,AllowRequestToJoinLeave,AutoAcceptRequestToJoinLeave,OnlyAllowMembersViewMembership" -Quiet
+        $r.MemberGroup = [string]$g.Title
+        $r.AllowMembersEditMembership = [bool]$g.AllowMembersEditMembership
+        $r.AllowRequestToJoinLeave = [bool]$g.AllowRequestToJoinLeave
+        $r.AutoAcceptRequestToJoinLeave = [bool]$g.AutoAcceptRequestToJoinLeave
+        $r.OnlyAllowMembersViewMembership = [bool]$g.OnlyAllowMembersViewMembership
+    }
+    catch { }
+    if ($null -ne $r.MembersCanShare) { $r.AccessRequestsOn = ($r.UseAccessRequestDefault -eq $true) -or [bool]$r.RequestAccessEmail }
+    return $r
+}
+
+function Get-ShareInfoCore {
+    param($Site)
+    $t = $null; $sp = $null
+    if ($script:HasAdmin) {
+        try { $t = Get-TenantShareSettings } catch { Write-Log "Tenant-deelinstellingen niet gelezen: $($_.Exception.Message)" 'warning' }
+        try { $sp = Get-SiteShareProps $Site.Url } catch { Write-Log "Site-deelinstellingen $($Site.Url) niet gelezen: $($_.Exception.Message)" 'warning' }
+    }
+    $w = Invoke-OnSite $Site { Get-WebShareSettingsCore $Site }
+    $info = @{ Tenant = $t; SiteProps = $sp; Web = $w; IsOneDrive = [bool]$Site.IsOneDrive; Eff = $null; Allow = @() }
+    $info.Eff = Get-EffectiveSharing $info
+    if ($t) { $ag = Get-ShareAllowGroups $t; $info.Allow = @($ag) }
+    if ($info.Allow.Count) { try { Resolve-Groups $info.Allow } catch { } }
+    return $info
+}
+
+function Get-EffectiveSharing {
+    # Strengste van tenant- en site-instelling
+    param($Info)
+    $t = $Info.Tenant; $sp = $Info.SiteProps
+    $tv = $null
+    if ($t) {
+        $tv = Get-D $t 'SharingCapability'
+        if ($Info.IsOneDrive -and $null -ne (Get-D $t 'OneDriveSharingCapability')) { $tv = Get-D $t 'OneDriveSharingCapability' }
+    }
+    $sv = Get-D $sp 'SharingCapability'
+    $vals = @(@($tv, $sv) | Where-Object { $null -ne $_ -and "$_" -match '^\d+$' -and $script:ShareRank.ContainsKey([int]$_) } | ForEach-Object { [int]$_ })
+    if (-not $vals.Count) { return $null }
+    return ($vals | Sort-Object { $script:ShareRank[$_] } | Select-Object -First 1)
+}
+
+function Get-ShareAllowGroups {
+    # Groepen die (als enige) extern mogen delen
+    param($T)
+    $ids = New-Object System.Collections.Generic.List[string]
+    foreach ($n in 'GuestSharingGroupAllowListInTenantByPrincipalIdentity', 'GuestSharingGroupAllowListInTenant') {
+        foreach ($x in @(Get-D $T $n)) {
+            foreach ($m in [regex]::Matches([string]$x, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')) {
+                $id = $m.Value.ToLower()
+                if (-not $ids.Contains($id)) { $ids.Add($id) }
+            }
+        }
+    }
+    return ,$ids.ToArray()
+}
+
+function Test-ShareAllowed {
+    # Is de gebruiker (ook genest) lid van een van de groepen die extern mogen delen?
+    param([string]$Upn, [string[]]$GroupIds)
+    $k = $Upn.ToLower()
+    if ($script:ShareGroupCheck.ContainsKey($k)) { return $script:ShareGroupCheck[$k] }
+    $res = $null
+    try {
+        $r = Invoke-Graph "users/$([uri]::EscapeDataString($Upn))/checkMemberGroups" -Method POST -Body @{ groupIds = @($GroupIds) } -Quiet
+        $res = (@($r.value).Count -gt 0)
+    }
+    catch { Write-Log "Groepslidmaatschap $Upn niet gecontroleerd: $($_.Exception.Message)" 'warning' }
+    $script:ShareGroupCheck[$k] = $res
+    return $res
+}
+
+function Get-EnumText {
+    param($Map, $Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return '(leeg)' }
+    $i = 0
+    if ([int]::TryParse("$Value", [ref]$i) -and $Map.ContainsKey($i)) { return "$($Map[$i]) ($i)" }
+    return "$Value"
+}
+
+function Format-ShareValue {
+    param($V)
+    if ($null -eq $V) { return '(leeg)' }
+    if ($V -is [bool]) { if ($V) { return 'Ja' } else { return 'Nee' } }
+    if ($V -is [string]) {
+        if ($V -eq '') { return '(leeg)' }
+        if ($V -match '^/Date\((-?\d+)') { try { return ([DateTimeOffset]::FromUnixTimeMilliseconds([int64]$Matches[1])).LocalDateTime.ToString('yyyy-MM-dd HH:mm') } catch { } }
+        return $V
+    }
+    if ($V -is [System.Collections.IDictionary]) { return (@($V.Keys | Where-Object { $_ -notmatch '^_Object' } | ForEach-Object { "$_=$($V[$_])" }) -join '; ') }
+    if ($V -is [System.Collections.IEnumerable]) {
+        $a = @($V | ForEach-Object { "$_" })
+        if (-not $a.Count) { return '(leeg)' }
+        return ($a -join ', ')
+    }
+    return "$V"
+}
+
+function Get-MembersCanShare {
+    # $true/$false/$null: mogen mensen met Bewerken-rechten delen?
+    param($Info)
+    if ($Info.IsOneDrive) {
+        $v = Get-D $Info.Tenant 'ODBMembersCanShare'
+        if ($null -eq $v) { return $null }
+        return ([int]$v -ne 2)
+    }
+    return $Info.Web.MembersCanShare
+}
+
+function Get-MemberShareText {
+    param($Info, [switch]$Short)
+    $w = $Info.Web
+    $can = Get-MembersCanShare $Info
+    if ($null -eq $can) { return $(if ($Short) { '?' } else { 'Onbekend (niet gelezen)' }) }
+    if ($Info.IsOneDrive) {
+        if ($can) { return $(if ($Short) { 'Ja' } else { 'Mensen met Bewerken-rechten mogen bestanden en mappen delen' }) }
+        return $(if ($Short) { 'Alleen eigenaar' } else { 'Alleen de eigenaar mag delen' })
+    }
+    if ($can -and $w.AllowMembersEditMembership) { return $(if ($Short) { 'Alles' } else { 'Eigenaars en leden mogen bestanden, mappen en de site delen; Bewerken-rechten: bestanden en mappen' }) }
+    if ($can) { return $(if ($Short) { 'Bestanden/mappen' } else { 'Eigenaars en Bewerken-rechten mogen bestanden en mappen delen; alleen eigenaars de site' }) }
+    return $(if ($Short) { 'Alleen eigenaars' } else { 'Alleen site-eigenaars mogen bestanden, mappen en de site delen' })
+}
+
+function Get-ShareVerdict {
+    # Mag deze machtiging delen, en met wie?
+    param($Row, $Info)
+    $low = [uint64]$Row.PermLow
+    if ($low -eq 0) {
+        # Terugval op de naam van het machtigingsniveau
+        if ($Row.Roles -match 'Volledig beheer|Full Control') { $low = [uint64]4294967295 }
+        elseif ($Row.Roles -match 'Bewerken|Edit|Bijdragen|Contribute|Ontwerpen|Design') { $low = $script:PermEdit -bor $script:PermView }
+        elseif ($Row.Roles -match 'Lezen|Read|Alleen weergeven|View Only') { $low = $script:PermView }
+    }
+    $w = $Info.Web
+    $t = $Info.Tenant
+    $full = ($Row.Mode -eq 'admin') -or (($low -band $script:PermManage) -ne 0)
+    $edit = ($low -band $script:PermEdit) -ne 0
+    $view = ($low -band $script:PermView) -ne 0
+    $can = Get-MembersCanShare $Info
+    $canTxt = ''
+    if ($null -eq $can) { $can = $true; $canTxt = ' (site-instelling niet gelezen; standaard aangenomen)' }
+    $req = $w -and $w.AccessRequestsOn
+    $delen = 'Nee'; $note = ''
+    if ($full) {
+        $delen = 'Volledig'
+        $note = $(if ($Row.Mode -eq 'admin') { 'Sitebeheerder: ' } else { '' }) + 'kan bestanden, mappen en de site delen en rechten direct toekennen'
+    }
+    elseif ($edit) {
+        if ($can) {
+            if (-not $Info.IsOneDrive -and $w.AllowMembersEditMembership -and $Row.Source -match '\[leden\]$') {
+                $delen = 'Bestanden/mappen + site'; $note = "Mag bestanden en mappen delen en anderen toevoegen aan '$($w.MemberGroup)'"
+            }
+            else { $delen = 'Bestanden/mappen'; $note = 'Mag bestanden en mappen delen (Bewerken-rechten); de site zelf delen kan alleen een eigenaar' }
+            $note += $canTxt
+        }
+        elseif ($req) { $delen = 'Aanvragen'; $note = 'Delen wordt een toegangsaanvraag die een eigenaar moet goedkeuren' }
+        else { $delen = 'Nee'; $note = 'Alleen eigenaars mogen delen op deze site' }
+    }
+    elseif ($view) {
+        $delen = 'Bestaande toegang'
+        $note = "Kan alleen een link sturen naar mensen die al toegang hebben$(if ($req) { ', of toegang aanvragen voor anderen' })"
+    }
+    else { $note = 'Geen leesrechten' }
+
+    if ($Row.Kind -eq 'guest' -and $Row.Mode -ne 'admin' -and $delen -in 'Volledig', 'Bestanden/mappen', 'Bestanden/mappen + site' -and (Get-D $t 'PreventExternalUsersFromResharing') -eq $true) {
+        $delen = 'Nee (gast)'; $note = "Gasten mogen niet doordelen (tenant-instelling); rechten: $($Row.Roles)"
+    }
+    if ($Row.Kind -in 'everyone', 'everyoneext' -and $delen -ne 'Nee') { $note = "LET OP - geldt voor de hele organisatie. $note" }
+
+    $with = ''
+    if ($delen -eq 'Bestaande toegang') { $with = 'Alleen mensen die al toegang hebben' }
+    elseif ($delen -eq 'Aanvragen') { $with = 'Na goedkeuring door een eigenaar' }
+    elseif ($delen -in 'Volledig', 'Bestanden/mappen', 'Bestanden/mappen + site') {
+        if ($null -eq $Info.Eff) { $with = 'Onbekend (SharePoint-beheerrol nodig)' }
+        else {
+            $rank = $script:ShareRank[[int]$Info.Eff]
+            $with = $script:ShareWithLabels[$rank]
+            if ($rank -ge 1 -and $Info.Allow.Count) {
+                if ($Row.Kind -eq 'user' -and $Row.Upn) {
+                    $ok = Test-ShareAllowed $Row.Upn $Info.Allow
+                    if ($ok -eq $false) { $with = 'Alleen intern'; $note += ' - niet in een groep die extern mag delen' }
+                    elseif ($ok -eq $true) { $note += ' - lid van een groep die extern mag delen' }
+                    else { $with += ' (lidmaatschap deelgroep onbekend)' }
+                }
+                elseif ($Row.Kind -ne 'guest') { $with += ' (extern alleen voor leden van de toegestane groepen)' }
+            }
+            $sp = $Info.SiteProps
+            $mode = Get-D $sp 'SharingDomainRestrictionMode'
+            $allowD = Get-D $sp 'SharingAllowedDomainList'; $blockD = Get-D $sp 'SharingBlockedDomainList'
+            if (-not $mode -or [int]$mode -eq 0) { $mode = Get-D $t 'SharingDomainRestrictionMode'; $allowD = Get-D $t 'SharingAllowedDomainList'; $blockD = Get-D $t 'SharingBlockedDomainList' }
+            if ($rank -ge 1 -and $mode) {
+                if ([int]$mode -eq 1) { $with += " - alleen domeinen: $allowD" }
+                elseif ([int]$mode -eq 2) { $with += " - behalve: $blockD" }
+            }
+        }
+    }
+    return @{ Delen = $delen; MetWie = $with; Note = $note }
+}
+
+function New-ShareSetting {
+    param($List, [string]$Part, [string]$Name, [string]$Value, [string]$Note = '')
+    [void]$List.Add(@{ Onderdeel = $Part; Instelling = $Name; Waarde = $Value; Toelichting = $Note })
+}
+
+function Add-ShareSpecRows {
+    param($List, [string]$Part, $Dict, $Spec, $Shown)
+    if (-not ($Dict -is [System.Collections.IDictionary])) { return }
+    foreach ($e in $Spec) {
+        $n = $e[0]
+        if (-not (Test-DKey $Dict $n)) { continue }
+        [void]$Shown.Add($n)
+        $v = $Dict[$n]
+        $txt = if ($e[2]) { Get-EnumText (Get-Variable -Scope Script -Name $e[2] -ValueOnly) $v } else { Format-ShareValue $v }
+        New-ShareSetting $List $Part $e[1] $txt $e[3]
+    }
+}
+
+function Get-ShareSettingRows {
+    param($Info)
+    $L = New-Object System.Collections.ArrayList
+    $t = $Info.Tenant; $sp = $Info.SiteProps; $w = $Info.Web
+    $sum = 'Samenvatting'
+    New-ShareSetting $L $sum 'Effectief extern delen' $(if ($null -ne $Info.Eff) { $script:SharingLabels[[int]$Info.Eff] } else { 'Onbekend' }) 'Strengste van tenant- en site-instelling'
+    New-ShareSetting $L $sum 'Wie mag delen' (Get-MemberShareText $Info) $(if ($Info.IsOneDrive) { 'Tenant-instelling ODBMembersCanShare' } else { "Site-instelling 'Wijzigen hoe leden kunnen delen'" })
+    if ($Info.Allow.Count) {
+        $names = @($Info.Allow | ForEach-Object { $g = $script:GroupCache[$_]; if ($g -and -not $g.Missing) { $g.displayName } else { $_ } })
+        New-ShareSetting $L $sum 'Extern delen alleen door leden van' ($names -join ', ') 'Overige gebruikers kunnen alleen intern delen'
+    }
+    if ($t -and (Get-D $t 'PreventExternalUsersFromResharing') -eq $true) { New-ShareSetting $L $sum 'Gasten' 'Mogen niet doordelen' '' }
+    elseif ($t) { New-ShareSetting $L $sum 'Gasten' 'Mogen doordelen (met Bewerken-rechten)' 'Tenant: PreventExternalUsersFromResharing = Nee' }
+    if (-not $Info.IsOneDrive -and $w) {
+        New-ShareSetting $L $sum 'Toegangsaanvragen' $(if ($null -eq $w.AccessRequestsOn) { 'Onbekend' } elseif ($w.AccessRequestsOn) { 'Aan' } else { 'Uit' }) `
+            $(if ($w.UseAccessRequestDefault) { 'Naar de eigenaars van de site' } elseif ($w.RequestAccessEmail) { "Naar $($w.RequestAccessEmail)" } else { '' })
+    }
+    if (-not $script:HasAdmin) { New-ShareSetting $L $sum 'Let op' 'Tenant- en site-eigenschappen niet gelezen' 'Hiervoor is de rol SharePoint Administrator nodig' }
+
+    if (-not $Info.IsOneDrive -and $w) {
+        $p = 'Site (machtigingen)'
+        New-ShareSetting $L $p 'Leden mogen delen (MembersCanShare)' (Format-ShareValue $w.MembersCanShare) 'Uit = alleen eigenaars mogen delen'
+        New-ShareSetting $L $p 'Leden mogen leden toevoegen (AllowMembersEditMembership)' (Format-ShareValue $w.AllowMembersEditMembership) "Ledengroep: $($w.MemberGroup)"
+        New-ShareSetting $L $p 'Verzoek om lid te worden toegestaan' (Format-ShareValue $w.AllowRequestToJoinLeave) $(if ($w.AutoAcceptRequestToJoinLeave) { 'Wordt automatisch geaccepteerd' } else { '' })
+        New-ShareSetting $L $p 'Alleen leden zien het lidmaatschap' (Format-ShareValue $w.OnlyAllowMembersViewMembership) ''
+        New-ShareSetting $L $p 'Toegangsaanvragen naar eigenaarsgroep' (Format-ShareValue $w.UseAccessRequestDefault) ''
+        New-ShareSetting $L $p 'Toegangsaanvragen naar e-mail' $(if ($w.RequestAccessEmail) { $w.RequestAccessEmail } else { '(leeg)' }) ''
+    }
+    $shownS = New-Object System.Collections.Generic.HashSet[string]
+    $shownT = New-Object System.Collections.Generic.HashSet[string]
+    Add-ShareSpecRows $L 'Site (beheercentrum)' $sp $script:SiteShareSpec $shownS
+    Add-ShareSpecRows $L 'Tenant' $t $script:TenantShareSpec $shownT
+    # Alle overige deel-gerelateerde eigenschappen (ruw)
+    foreach ($pair in @(@('Site (overig)', $sp, $shownS), @('Tenant (overig)', $t, $shownT))) {
+        $d = $pair[1]
+        if (-not ($d -is [System.Collections.IDictionary])) { continue }
+        foreach ($k in @($d.Keys | Sort-Object)) {
+            if ($k -match '^_Object' -or $pair[2].Contains($k) -or $k -notmatch $script:ShareRawPattern) { continue }
+            New-ShareSetting $L $pair[0] $k (Format-ShareValue $d[$k]) ''
+        }
+    }
+    return $L.ToArray()
+}
+
+function Update-ShareInfo {
+    param([string]$P)
+    $x = $script:Ctx[$P]
+    $s = $x.Site
+    $x.ShareInfo = $null
+    if (-not $s) { Update-ShareWhoGrid $P; return }
+    Set-Status "Deelinstellingen laden: $($s.Title)..."
+    $info = Get-ShareInfoCore $s
+    $x.ShareInfo = $info
+    $s.MemberShare = Get-MemberShareText $info -Short
+    $i = 0
+    foreach ($r in $x.PermRows) {
+        $i++
+        if ($r.Empty) { continue }
+        if ($info.Allow.Count -and $i % 20 -eq 0) { Set-Status "Deelrechten bepalen ($i van $($x.PermRows.Count))..." }
+        $r.ShareV = Get-ShareVerdict $r $info
+    }
+    $items = New-Object System.Collections.ArrayList
+    [void]$items.Add('Overzicht: site + bibliotheken/lijsten met eigen rechten')
+    [void]$items.Add('Site (en alles wat rechten overneemt)')
+    foreach ($l in @($x.Libs)) { [void]$items.Add("$($l.Kind): $($l.Title)$(if ($l.Unique) { '   [eigen rechten]' })") }
+    $x.CmbShareScope.ItemsSource = $items.ToArray()
+    $x.CmbShareScope.SelectedIndex = 0
+    Update-ShareWhoGrid $P
+    Set-GridRows $x.ShareSetGrid @('Onderdeel', 'Instelling', 'Waarde', 'Toelichting') (Get-ShareSettingRows $info)
+}
+
+function Get-ShareScopeRows {
+    # Machtigingsregels voor de gekozen bereik-index (0 = overzicht, 1 = site, 2+ = bibliotheek)
+    param([string]$P, [int]$Index)
+    $x = $script:Ctx[$P]
+    $out = New-Object System.Collections.ArrayList
+    if ($Index -le 0) { foreach ($r in $x.PermRows) { [void]$out.Add(@($r, $r.Scope)) } }
+    elseif ($Index -eq 1) { foreach ($r in $x.PermRows) { if ($r.Scope -eq 'Site') { [void]$out.Add(@($r, 'Site')) } } }
+    else {
+        $lib = @($x.Libs)[$Index - 2]
+        if (-not $lib) { return ,$out.ToArray() }
+        $label = "$($lib.Kind): $($lib.Title)"
+        foreach ($r in $x.PermRows) {
+            if ($lib.Unique) { if ($r.ListId -eq $lib.Id -or $r.Mode -eq 'admin') { [void]$out.Add(@($r, $label)) } }
+            elseif ($r.Scope -eq 'Site') { [void]$out.Add(@($r, "$label (van site)")) }
+        }
+    }
+    return ,$out.ToArray()
+}
+
+function ConvertTo-ShareGridRow {
+    param($R, [string]$Scope, [int]$Idx)
+    $g = ConvertTo-PermGridRow $R $Idx
+    return @{ Idx = $Idx; Bereik = $Scope; Naam = $g.Naam; Soort = $g.Soort; Via = $g.Bron; Rechten = $g.Rechten
+              Delen = $R.ShareV.Delen; MetWie = $R.ShareV.MetWie; Toelichting = $R.ShareV.Note; Login = $g.Login }
+}
+
+$script:ShareCols = @('Idx:int', 'Bereik', 'Naam', 'Soort', 'Via', 'Rechten', 'Delen', 'MetWie', 'Toelichting', 'Login')
+
+function Update-ShareWhoGrid {
+    param([string]$P)
+    $x = $script:Ctx[$P]
+    if (-not $x.ShareInfo) {
+        $x.ShareGrid.ItemsSource = $null
+        $x.LblShareSum.Text = $(if ($x.Site) { 'Deelinstellingen niet geladen - klik op Vernieuwen' } else { '' })
+        return
+    }
+    $rows = New-Object System.Collections.ArrayList
+    $count = @{}
+    $pairs = Get-ShareScopeRows $P $x.CmbShareScope.SelectedIndex
+    foreach ($pr in @($pairs)) {
+        $r = $pr[0]
+        if ($r.Empty -or -not $r.ShareV) { continue }
+        [void]$rows.Add((ConvertTo-ShareGridRow $r $pr[1] ([array]::IndexOf($x.PermRows, $r))))
+        $count[$r.ShareV.Delen] = 1 + [int]$count[$r.ShareV.Delen]
+    }
+    Set-GridRows $x.ShareGrid $script:ShareCols $rows
+    $parts = foreach ($k in 'Volledig', 'Bestanden/mappen + site', 'Bestanden/mappen', 'Aanvragen', 'Bestaande toegang', 'Nee (gast)', 'Nee') { if ($count[$k]) { "$($k): $($count[$k])" } }
+    $eff = if ($null -ne $x.ShareInfo.Eff) { $script:SharingLabels[[int]$x.ShareInfo.Eff] } else { '?' }
+    $x.LblShareSum.Text = "Extern: $eff   |   $($parts -join '   ')"
+}
+
+function Invoke-ShareReload {
+    param([string]$P)
+    $x = $script:Ctx[$P]
+    if (-not $x.Site) { return }
+    Enter-Busy 'Deelinstellingen vernieuwen...'
+    try {
+        $script:TenantShare = $null
+        $script:ShareGroupCheck = @{}
+        Update-ShareInfo $P
+        Set-Status "Deelinstellingen van $($x.Site.Title) bijgewerkt" 'success'
+    }
+    catch { Write-Log "Deelinstellingen: $($_.Exception.Message)" 'error'; Set-Status 'Deelinstellingen laden mislukt' 'error' }
+    finally { Exit-Busy }
+}
+
+# --- Bestaande deellinks (SharePoint-groepen 'SharingLinks.<item>.<soort>.<id>') ---
+
+function Get-LinkKindText {
+    param([string]$K)
+    $aud = if ($K -match '^Anonymous') { 'Iedereen met de link' } elseif ($K -match '^Organization') { 'Personen in de organisatie' }
+           elseif ($K -match '^Flexible') { 'Specifieke personen' } else { $K }
+    $role = if ($K -match 'RestrictedView$') { 'Bekijken (zonder download)' } elseif ($K -match 'View$') { 'Bekijken' } elseif ($K -match 'Edit$') { 'Bewerken' }
+            elseif ($K -match 'Review$') { 'Controleren' } elseif ($K -match '^Flexible') { 'Per link (bekijken of bewerken)' } else { '' }
+    return @($aud, $role)
+}
+
+function Resolve-ShareItem {
+    param([string]$Base, [string]$UniqueId)
+    try {
+        $f = Invoke-SP "$Base/_api/web/GetFileById('$UniqueId')?`$select=ServerRelativeUrl,Name" -Quiet
+        return @{ Path = [string]$f.ServerRelativeUrl; Name = [string]$f.Name; Type = 'Bestand' }
+    } catch { }
+    try {
+        $d = Invoke-SP "$Base/_api/web/GetFolderById('$UniqueId')?`$select=ServerRelativeUrl,Name" -Quiet
+        return @{ Path = [string]$d.ServerRelativeUrl; Name = [string]$d.Name; Type = 'Map' }
+    } catch { }
+    return @{ Path = ''; Name = "(item $UniqueId)"; Type = 'Item/onbekend' }
+}
+
+function Get-SharingLinksCore {
+    param($Site, $Libs, [int]$Max = 500)
+    $base = $Site.Url
+    $auth = ([uri]$base).GetLeftPart([UriPartial]::Authority)
+    $sg = @((Invoke-SP "$base/_api/web/sitegroups?`$expand=Users" -Quiet).value | Where-Object { [string]$_.Title -match '^SharingLinks\.' })
+    $libList = @($Libs | Where-Object { $_.Path } | Sort-Object { $_.Path.Length } -Descending)
+    $rows = New-Object System.Collections.ArrayList
+    $cache = @{}
+    $n = 0
+    foreach ($g in $sg) {
+        if ($script:StopRequested) { Write-Log 'Gestopt door gebruiker' 'warning'; break }
+        if ($n -ge $Max) { Write-Log "$($Site.Title): meer dan $Max deellinks - alleen de eerste $Max getoond" 'warning'; break }
+        $n++
+        if ($n % 10 -eq 0) { Set-Status "Deellinks $n van $($sg.Count) ($($Site.Title))..." }
+        if ([string]$g.Title -notmatch '^SharingLinks\.([0-9a-fA-F-]{36})\.([A-Za-z]+)\.') { continue }
+        $uid = $Matches[1]; $kind = $Matches[2]
+        if (-not $cache.ContainsKey($uid)) { $cache[$uid] = Resolve-ShareItem $base $uid }
+        $it = $cache[$uid]
+        $lib = $null
+        if ($it.Path) { $lib = $libList | Where-Object { $it.Path -eq $_.Path -or $it.Path.StartsWith($_.Path + '/', [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1 }
+        $users = @(Get-Coll $g.Users | Where-Object { [string]$_.Title -ne 'System Account' -and [string]$_.LoginName -notmatch 'SHAREPOINT\\system' })
+        $kt = Get-LinkKindText $kind
+        $ext = @($users | Where-Object { [string]$_.LoginName -match '#ext#|urn%3aspo%3aguest|urn:spo:guest' }).Count
+        [void]$rows.Add(@{
+            Bibliotheek = $(if ($lib) { $lib.Title } else { '' }); Item = $it.Name; Type = $it.Type; Linktype = $kt[0]; Rechten = $kt[1]
+            Ontvangers = (@($users | ForEach-Object { if ($_.Email) { "$($_.Title) <$($_.Email)>" } else { [string]$_.Title } }) -join '; ')
+            Aantal = $users.Count; Extern = $(if ($kind -match '^Anonymous') { 'Anoniem' } elseif ($ext) { "Ja ($ext)" } else { '' })
+            Pad = $it.Path; Url = $(if ($it.Path) { $auth + $it.Path } else { '' }); Groep = [string]$g.Title; GroupId = $g.Id
+        })
+    }
+    return ,$rows.ToArray()
+}
+
+$script:ShareLinkCols = @('Idx:int', 'Bibliotheek', 'Item', 'Type', 'Linktype', 'Rechten', 'Aantal:int', 'Extern', 'Ontvangers', 'Pad')
+
+function Update-ShareLinkGrid {
+    param([string]$P)
+    $x = $script:Ctx[$P]
+    $i = 0
+    $rows = foreach ($l in @($x.Links)) { $h = @{} + $l; $h.Idx = $i++; $h }
+    Set-GridRows $x.ShareLinkGrid $script:ShareLinkCols $rows
+    $links = @($x.Links)
+    if (-not $x.LinksLoaded) { $x.LblShareLinks.Text = "Klik op 'Deellinks ophalen' om te zien welke bestanden en mappen met een link gedeeld zijn."; return }
+    $anon = @($links | Where-Object { $_.Linktype -eq 'Iedereen met de link' }).Count
+    $org = @($links | Where-Object { $_.Linktype -eq 'Personen in de organisatie' }).Count
+    $ext = @($links | Where-Object { $_.Extern -match '^Ja' }).Count
+    $x.LblShareLinks.Text = "$($links.Count) deellink(s): $anon anoniem, $org organisatie, $($links.Count - $anon - $org) specifieke personen; $ext met externe ontvangers"
+}
+
+function Invoke-ShareLinks {
+    param([string]$P)
+    $x = $script:Ctx[$P]
+    if (-not $x.Site) { Show-Msg 'Selecteer eerst een site.' 'Deellinks' | Out-Null; return }
+    $s = $x.Site
+    Start-LongOp "Deellinks ophalen: $($s.Title)..."
+    try {
+        $libs = @($x.Libs)
+        $x.Links = @(Invoke-OnSite $s { Get-SharingLinksCore $s $libs })
+        $x.LinksLoaded = $true
+        Update-ShareLinkGrid $P
+        Set-Status "$($s.Title): $($x.Links.Count) deellink(s)" 'success'
+    }
+    catch {
+        Write-Log "Deellinks $($s.Url): $($_.Exception.Message)" 'error'
+        Set-Status 'Deellinks ophalen mislukt' 'error'
+    }
+    finally { Stop-LongOp }
+}
+
+function Open-ShareLinkItem {
+    param([string]$P)
+    $x = $script:Ctx[$P]
+    foreach ($r in @(Get-SelectedRows $x.ShareLinkGrid | Select-Object -First 5)) {
+        $l = $x.Links[[int]$r['Idx']]
+        if ($l.Url) { Start-Process $l.Url }
+    }
+}
+
+function Invoke-ShareReport {
+    # CSV: per site (en per bibliotheek met eigen rechten) wie mag delen, met wie, plus de belangrijkste instellingen
+    $sites = @(Get-Targets 'S' 'Deelrapport')
+    if (-not $sites.Count) { return }
+    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg.Filter = 'CSV (puntkomma)|*.csv'
+    $dlg.FileName = "SharePoint-wie-mag-delen-$(Get-Date -Format 'yyyyMMdd-HHmm').csv"
+    if (-not $dlg.ShowDialog($script:Window)) { return }
+    Start-LongOp 'Deelrapport maken...'
+    $out = New-Object System.Collections.ArrayList
+    $n = 0
+    try {
+        foreach ($s in $sites) {
+            if ($script:StopRequested) { break }
+            $n++
+            Set-Status "Deelrapport - site $n van $($sites.Count): $($s.Title)"
+            try {
+                $perm = @(Get-SitePermissions $s)
+                $info = Get-ShareInfoCore $s
+                $s.MemberShare = Get-MemberShareText $info -Short
+                $eff = if ($null -ne $info.Eff) { $script:SharingLabels[[int]$info.Eff] } else { '?' }
+                $lnk = Get-D $info.SiteProps 'DefaultSharingLinkType'
+                foreach ($r in $perm) {
+                    if ($r.Empty) { continue }
+                    $v = Get-ShareVerdict $r $info
+                    $g = ConvertTo-PermGridRow $r 0
+                    [void]$out.Add([pscustomobject][ordered]@{
+                        Site = $s.Title; Url = $s.Url; Bereik = $r.Scope; Naam = $g.Naam; Soort = $g.Soort; Via = $g.Bron; Rechten = $g.Rechten
+                        MagDelen = $v.Delen; MetWie = $v.MetWie; Toelichting = $v.Note; Login = $g.Login
+                        SiteExternDelen = $eff; LedenMogenDelen = (Get-MemberShareText $info)
+                        Toegangsaanvragen = $(if ($null -eq $info.Web.AccessRequestsOn) { '?' } elseif ($info.Web.AccessRequestsOn) { 'Aan' } else { 'Uit' })
+                        StandaardLink = $(if ($null -ne $lnk) { Get-EnumText $script:LinkTypeLabels $lnk } else { '' })
+                    })
+                }
+            }
+            catch {
+                [void]$out.Add([pscustomobject][ordered]@{ Site = $s.Title; Url = $s.Url; Bereik = ''; Naam = $_.Exception.Message; Soort = ''; Via = 'FOUT'; Rechten = ''
+                    MagDelen = ''; MetWie = ''; Toelichting = ''; Login = ''; SiteExternDelen = ''; LedenMogenDelen = ''; Toegangsaanvragen = ''; StandaardLink = '' })
+                Write-Log "$($s.Url): $($_.Exception.Message)" 'error'
+            }
+        }
+        $out | Export-Csv -Path $dlg.FileName -NoTypeInformation -Delimiter ';' -Encoding UTF8
+        Write-Log "Deelrapport opgeslagen: $($dlg.FileName) ($($out.Count) regels)" 'success'
+        Set-Status "Deelrapport opgeslagen ($($out.Count) regels)" 'success'
+    }
+    finally { Stop-LongOp }
+    Update-SiteGrid
 }
 
 #endregion
@@ -1969,6 +2643,10 @@ function Invoke-BulkDetails {
                     $s.VersionsMB = $v
                     $rb = Get-RecycleInfoCore $s
                     $s.RecycleMB = $rb.MB
+                    if (-not $s.IsOneDrive) {
+                        $ws = Get-WebShareSettingsCore $s
+                        $s.MemberShare = Get-MemberShareText @{ Web = $ws; IsOneDrive = $false; Tenant = $null } -Short
+                    }
                     if ($rb.Capped) { Write-Log "$($s.Title): prullenbak heeft 5000+ items, grootte is een ondergrens" 'warning' }
                 }
             }
@@ -2681,6 +3359,19 @@ $script:StylesXaml = @'
   <Setter Property="FontWeight" Value="SemiBold"/>
   <Style.Triggers>
     <Trigger Property="Text" Value="Actief"><Setter Property="Foreground" Value="#107C10"/><Setter Property="FontWeight" Value="Normal"/></Trigger>
+  </Style.Triggers>
+</Style>
+<Style x:Key="CellShare" TargetType="TextBlock" BasedOn="{StaticResource CellText}">
+  <Setter Property="FontWeight" Value="SemiBold"/>
+  <Setter Property="Foreground" Value="#333333"/>
+  <Style.Triggers>
+    <Trigger Property="Text" Value="Volledig"><Setter Property="Foreground" Value="#C42B1C"/></Trigger>
+    <Trigger Property="Text" Value="Bestanden/mappen + site"><Setter Property="Foreground" Value="#B26200"/></Trigger>
+    <Trigger Property="Text" Value="Bestanden/mappen"><Setter Property="Foreground" Value="#B26200"/></Trigger>
+    <Trigger Property="Text" Value="Aanvragen"><Setter Property="Foreground" Value="#0063B1"/></Trigger>
+    <Trigger Property="Text" Value="Bestaande toegang"><Setter Property="Foreground" Value="#555555"/><Setter Property="FontWeight" Value="Normal"/></Trigger>
+    <Trigger Property="Text" Value="Nee"><Setter Property="Foreground" Value="#107C10"/></Trigger>
+    <Trigger Property="Text" Value="Nee (gast)"><Setter Property="Foreground" Value="#107C10"/></Trigger>
   </Style.Triggers>
 </Style>
 <Style TargetType="GroupBox">
@@ -3485,6 +4176,74 @@ function Get-DetailXaml {
         </DataGrid>
       </Grid>
     </TabItem>
+    <TabItem Header=" Delen ">
+      <TabControl Margin="2">
+        <TabItem Header=" Wie mag delen ">
+          <DockPanel Margin="4">
+            <WrapPanel DockPanel.Dock="Top">
+              <TextBlock Text="Bereik:" Style="{StaticResource Lbl}"/>
+              <ComboBox x:Name="{P}_CmbShareScope" Width="340" Height="26" Margin="0,0,10,6"/>
+              <Button x:Name="{P}_BtnShareReload" Content="Vernieuwen" Style="{StaticResource ToolGray}"/>
+              <Button x:Name="{P}_BtnShareEditGroup" Content="Groep bewerken" Style="{StaticResource ToolPurple}"/>
+              <Button x:Name="{P}_BtnShareCsv" Content="Export CSV" Style="{StaticResource ToolGray}"/>
+              <TextBlock x:Name="{P}_LblShareSum" Style="{StaticResource Lbl}" Foreground="#444444" Margin="8,0,0,6" MaxWidth="760" TextTrimming="CharacterEllipsis"/>
+            </WrapPanel>
+            <DataGrid x:Name="{P}_ShareGrid">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Bereik" Binding="{Binding Bereik}" Width="170" ElementStyle="{StaticResource CellScope}"/>
+                <DataGridTextColumn Header="Naam" Binding="{Binding Naam}" Width="180" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Soort" Binding="{Binding Soort}" Width="150" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Via" Binding="{Binding Via}" Width="190" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Rechten" Binding="{Binding Rechten}" Width="110" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Mag delen" Binding="{Binding Delen}" Width="150" ElementStyle="{StaticResource CellShare}"/>
+                <DataGridTextColumn Header="Met wie" Binding="{Binding MetWie}" Width="230" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Toelichting" Binding="{Binding Toelichting}" Width="320" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Login / UPN" Binding="{Binding Login}" Width="*" ElementStyle="{StaticResource CellText}"/>
+              </DataGrid.Columns>
+            </DataGrid>
+          </DockPanel>
+        </TabItem>
+        <TabItem Header=" Deelinstellingen ">
+          <DockPanel Margin="4">
+            <WrapPanel DockPanel.Dock="Top">
+              <TextBlock Style="{StaticResource Hint}" Margin="0,0,10,6" Text="Tenant (beheercentrum), site en de site-instelling 'Wijzigen hoe leden kunnen delen'. Onderaan alle overige deel-eigenschappen ruw."/>
+              <Button x:Name="{P}_BtnShareSetCsv" Content="Export CSV" Style="{StaticResource ToolGray}"/>
+            </WrapPanel>
+            <DataGrid x:Name="{P}_ShareSetGrid">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Onderdeel" Binding="{Binding Onderdeel}" Width="150" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Instelling" Binding="{Binding Instelling}" Width="320" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Waarde" Binding="{Binding Waarde}" Width="300" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Toelichting" Binding="{Binding Toelichting}" Width="*" ElementStyle="{StaticResource CellText}"/>
+              </DataGrid.Columns>
+            </DataGrid>
+          </DockPanel>
+        </TabItem>
+        <TabItem Header=" Gedeelde items (deellinks) ">
+          <DockPanel Margin="4">
+            <WrapPanel DockPanel.Dock="Top">
+              <Button x:Name="{P}_BtnShareLinks" Content="Deellinks ophalen" Style="{StaticResource Tool}" ToolTip="Alle deellinks op bestanden en mappen van deze site (max. 500)"/>
+              <Button x:Name="{P}_BtnShareLinkOpen" Content="Item openen" Style="{StaticResource ToolGray}"/>
+              <Button x:Name="{P}_BtnShareLinksCsv" Content="Export CSV" Style="{StaticResource ToolGray}"/>
+              <TextBlock x:Name="{P}_LblShareLinks" Style="{StaticResource Lbl}" Foreground="#444444" Margin="8,0,0,6"/>
+            </WrapPanel>
+            <DataGrid x:Name="{P}_ShareLinkGrid">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Bibliotheek" Binding="{Binding Bibliotheek}" Width="150" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Item" Binding="{Binding Item}" Width="200" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Type" Binding="{Binding Type}" Width="70" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Linktype" Binding="{Binding Linktype}" Width="170" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Rechten" Binding="{Binding Rechten}" Width="150" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Ontv." Binding="{Binding Aantal}" Width="50" ElementStyle="{StaticResource CellNum}"/>
+                <DataGridTextColumn Header="Extern" Binding="{Binding Extern}" Width="70" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Ontvangers / gebruikt door" Binding="{Binding Ontvangers}" Width="300" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Pad" Binding="{Binding Pad}" Width="*" ElementStyle="{StaticResource CellText}"/>
+              </DataGrid.Columns>
+            </DataGrid>
+          </DockPanel>
+        </TabItem>
+      </TabControl>
+    </TabItem>
   </TabControl>
 </Grid>
 '@
@@ -3565,6 +4324,7 @@ $script:MainXamlTemplate = @'
               <Button x:Name="BtnBulkRemove" Content="Toegang intrekken..." Style="{StaticResource ToolRed}"/>
               <Button x:Name="BtnBulkSharing" Content="Extern delen..." Style="{StaticResource ToolOrange}"/>
               <Button x:Name="BtnBulkReport" Content="Machtigingenrapport (CSV)" Style="{StaticResource Tool}"/>
+              <Button x:Name="BtnShareReport" Content="Deelrapport (CSV)" Style="{StaticResource Tool}" ToolTip="Per site en per bibliotheek met eigen rechten: wie mag delen, met wie, en de deelinstellingen (selectie of alle zichtbare)"/>
               <Button x:Name="BtnBulkGroups" Content="Groepen scannen" Style="{StaticResource ToolPurple}"/>
               <Border Style="{StaticResource Sep}"/>
               <TextBlock Text="Opslag:" FontWeight="SemiBold" Style="{StaticResource Lbl}"/>
@@ -3593,6 +4353,7 @@ $script:MainXamlTemplate = @'
               <DataGridTextColumn Header="Laatste activiteit" Binding="{Binding Activiteit}" Width="105" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="Eigenaar" Binding="{Binding Eigenaar}" Width="170" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="Extern delen" Binding="{Binding Delen}" Width="130" ElementStyle="{StaticResource CellText}"/>
+              <DataGridTextColumn Header="Leden delen" Binding="{Binding LedenDelen}" Width="110" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="Vergrendeld" Binding="{Binding Lock}" Width="80" ElementStyle="{StaticResource CellText}"/>
               <DataGridTextColumn Header="Bibl." Binding="{Binding Bibliotheken}" Width="45" ElementStyle="{StaticResource CellNum}"/>
               <DataGridTextColumn Header="Eigen rechten" Binding="{Binding Uniek}" Width="85" ElementStyle="{StaticResource CellNum}"/>
@@ -3774,7 +4535,7 @@ function Invoke-Connect {
         $script:BtnDisconnect.IsEnabled = $true
         foreach ($b in @($script:ChkAutoElevate, $script:ChkOdAutoElevate, $script:BtnBulkSharing, $script:BtnSiteQuota, $script:BtnSiteLock,
                          $script:BtnOdAdminAdd, $script:BtnOdAdminRemove, $script:BtnOdSharing, $script:BtnOdQuota, $script:BtnOdLock)) { $b.IsEnabled = $script:HasAdmin }
-        foreach ($b in @($script:BtnBulkAdd, $script:BtnBulkRemove, $script:BtnBulkReport, $script:BtnBulkGroups, $script:BtnGrpScan, $script:BtnAccScan,
+        foreach ($b in @($script:BtnBulkAdd, $script:BtnBulkRemove, $script:BtnBulkReport, $script:BtnShareReport, $script:BtnBulkGroups, $script:BtnGrpScan, $script:BtnAccScan,
                          $script:BtnSiteScan, $script:BtnSiteVersions, $script:BtnSiteRecycle, $script:BtnOdScan, $script:BtnOdVersions, $script:BtnOdRecycle, $script:BtnOdEmpty,
                          $script:BtnSiteRestore, $script:BtnOdRestore)) { $b.IsEnabled = $script:SpOk }
         Set-Status "Verbonden als $($script:MeUpn)" 'success'
@@ -3802,9 +4563,12 @@ function Invoke-Disconnect {
     $script:OdLoaded = $false
     $script:AccRows = @(); $script:GroupRows = @{}
     foreach ($P in 'S', 'O') {
-        $x = $script:Ctx[$P]; $x.Site = $null; $x.PermRows = @(); $x.Libs = @()
-        foreach ($g in @($x.PermGrid, $x.LibGrid, $x.LibPermGrid)) { $g.ItemsSource = $null }
+        $x = $script:Ctx[$P]; $x.Site = $null; $x.PermRows = @(); $x.Libs = @(); $x.ShareInfo = $null; $x.Links = @(); $x.LinksLoaded = $false
+        foreach ($g in @($x.PermGrid, $x.LibGrid, $x.LibPermGrid, $x.ShareGrid, $x.ShareSetGrid, $x.ShareLinkGrid)) { $g.ItemsSource = $null }
+        $x.CmbShareScope.ItemsSource = $null; $x.LblShareSum.Text = ''
     }
+    $script:TenantShare = $null
+    $script:ShareGroupCheck = @{}
     foreach ($g in @($script:SiteGrid, $script:OdGrid, $script:AccGrid, $script:GrpGrid)) { $g.ItemsSource = $null }
     $script:LblConn.Text = 'Niet verbonden'
     $script:LblConn.Foreground = New-Brush '#FFC864'
@@ -3826,7 +4590,8 @@ function New-MainWindow {
     $script:MainXaml = $xaml
     $script:Window = ConvertFrom-Xaml $xaml.Replace('{{STYLES}}', $script:StylesXaml)
     $ctl = Get-XamlControls $script:Window $xaml
-    $script:Ctx = @{ S = @{ Site = $null; PermRows = @(); Libs = @() }; O = @{ Site = $null; PermRows = @(); Libs = @() } }
+    $script:Ctx = @{ S = @{ Site = $null; PermRows = @(); Libs = @(); ShareInfo = $null; Links = @(); LinksLoaded = $false }
+                     O = @{ Site = $null; PermRows = @(); Libs = @(); ShareInfo = $null; Links = @(); LinksLoaded = $false } }
     foreach ($n in $ctl.Keys) {
         if ($null -eq $ctl[$n]) { throw "XAML-element '$n' niet gevonden" }
         if ($n -match '^(S|O)_(\w+)$') { $script:Ctx[$Matches[1]][$Matches[2]] = $ctl[$n] }
@@ -3875,6 +4640,7 @@ function New-MainWindow {
     $script:BtnBulkRemove.Add_Click({ Invoke-BulkAccess -Mode Remove })
     $script:BtnBulkSharing.Add_Click({ Invoke-BulkSharing 'S' })
     $script:BtnBulkReport.Add_Click({ Invoke-PermReport })
+    $script:BtnShareReport.Add_Click({ Invoke-ShareReport })
     $script:BtnBulkGroups.Add_Click({ Invoke-GroupScan; $script:MainArea.SelectedIndex = 3 })
     $script:BtnSiteQuota.Add_Click({ Invoke-BulkQuota 'S' })
     $script:BtnSiteLock.Add_Click({ Invoke-BulkLock 'S' })
@@ -3930,6 +4696,17 @@ function New-MainWindow {
         Add-Handler $x.BtnLibVerClean 'Click' "Invoke-LibVersionClean '$P'"
         Add-Handler $x.BtnLibOpen 'Click' "Open-Library '$P'"
         Add-Handler $x.BtnLibCsv 'Click' "Export-GridCsv `$script:Ctx['$P'].LibGrid '$csvName-bibliotheken'"
+        Add-Handler $x.CmbShareScope 'SelectionChanged' "Update-ShareWhoGrid '$P'"
+        Add-Handler $x.BtnShareReload 'Click' "Invoke-ShareReload '$P'"
+        Add-Handler $x.BtnShareEditGroup 'Click' "Open-GroupFromGrid '$P' `$script:Ctx['$P'].ShareGrid -Message"
+        Add-Handler $x.ShareGrid 'MouseDoubleClick' "Open-GroupFromGrid '$P' `$script:Ctx['$P'].ShareGrid"
+        Add-Handler $x.BtnShareCsv 'Click' "Export-GridCsv `$script:Ctx['$P'].ShareGrid '$csvName-wie-mag-delen'"
+        Add-Handler $x.BtnShareSetCsv 'Click' "Export-GridCsv `$script:Ctx['$P'].ShareSetGrid '$csvName-deelinstellingen'"
+        Add-Handler $x.BtnShareLinks 'Click' "Invoke-ShareLinks '$P'"
+        Add-Handler $x.BtnShareLinkOpen 'Click' "Open-ShareLinkItem '$P'"
+        Add-Handler $x.ShareLinkGrid 'MouseDoubleClick' "Open-ShareLinkItem '$P'"
+        Add-Handler $x.BtnShareLinksCsv 'Click' "Export-GridCsv `$script:Ctx['$P'].ShareLinkGrid '$csvName-deellinks'"
+        Update-ShareLinkGrid $P
     }
 
     # --- Gebruiker-toegang ---
